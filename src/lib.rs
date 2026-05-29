@@ -94,7 +94,7 @@ pub use parakeet_eou::{ParakeetEOU, ParakeetEOUHandle};
 pub use parakeet_unified::{ParakeetUnified, ParakeetUnifiedHandle, UnifiedStreamingConfig};
 
 #[cfg(feature = "multitalker")]
-pub use multitalker::{LatencyMode, MultitalkerASR, MultitalkerConfig, SpeakerTranscript, WordTimestamp};
+pub use multitalker::{ChunkResult, LatencyMode, MultitalkerASR, MultitalkerConfig, SpeakerTranscript, WordTimestamp};
 
 #[cfg(feature = "cohere")]
 pub use cohere::CohereASR;

@@ -9,6 +9,8 @@ pub struct TimedToken {
     pub text: String,
     pub start: f32,
     pub end: f32,
+    /// Confidence score (softmax probability of the chosen token). 0.0–1.0.
+    pub confidence: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +185,7 @@ impl ParakeetDecoder {
                         text: added_text.to_string(),
                         start: start_time,
                         end: end_time,
+                        confidence: 1.0, // single-speaker decoder doesn't expose logits
                     });
                 }
 

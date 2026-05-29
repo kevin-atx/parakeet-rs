@@ -14,13 +14,17 @@ impl ParakeetTDTDecoder {
         Self { vocab }
     }
 
-    /// Decode tokens with timestamps
-    /// For TDT models, greedy decoding is done in the model, here we just convert to text
+    /// Decode tokens with timestamps.
+    ///
+    /// Uses TDT duration predictions for accurate end times. The duration
+    /// value is the number of encoder frames the token spans. End time =
+    /// `start + duration * frame_time`. Falls back to next-token-start
+    /// when duration is 0 (blank/skip frames).
     pub fn decode_with_timestamps(
         &self,
         tokens: &[usize],
         frame_indices: &[usize],
-        _durations: &[usize],
+        durations: &[usize],
         hop_length: usize,
         sample_rate: usize,
     ) -> Result<TranscriptionResult> {
@@ -28,15 +32,21 @@ impl ParakeetTDTDecoder {
         let mut full_text = String::new();
         // TDT encoder does 8x subsampling
         let encoder_stride = 8;
+        let frame_secs = (encoder_stride * hop_length) as f32 / sample_rate as f32;
 
         for (i, &token_id) in tokens.iter().enumerate() {
             if let Some(token_text) = self.vocab.id_to_text(token_id) {
                 let frame = frame_indices[i];
-                let start = (frame * encoder_stride * hop_length) as f32 / sample_rate as f32;
-                let end = if i + 1 < frame_indices.len() {
-                    (frame_indices[i + 1] * encoder_stride * hop_length) as f32 / sample_rate as f32
+                let start = frame as f32 * frame_secs;
+                let end = if durations[i] > 0 {
+                    // Use TDT duration prediction for accurate end time.
+                    start + durations[i] as f32 * frame_secs
+                } else if i + 1 < frame_indices.len() {
+                    // Duration 0 (blank/skip) — fall back to next token's start.
+                    frame_indices[i + 1] as f32 * frame_secs
                 } else {
-                    start + 0.01
+                    // Last token with no duration — use one frame.
+                    start + frame_secs
                 };
 
                 // Handle SentencePiece format (▁ prefix for word start)
@@ -72,6 +82,7 @@ impl ParakeetTDTDecoder {
                         text: display_text,
                         start,
                         end,
+                        confidence: 1.0, // TDT decoder doesn't expose logits
                     });
                 }
             }

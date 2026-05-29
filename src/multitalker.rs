@@ -59,6 +59,8 @@ pub struct WordTimestamp {
     pub word: String,
     pub start_secs: f32,
     pub end_secs: f32,
+    /// Confidence score (min softmax probability across subword tokens). 0.0–1.0.
+    pub confidence: f32,
 }
 
 /// Per-speaker state for the multi-instance architecture.
@@ -67,8 +69,8 @@ struct SpeakerInstance {
     state_1: Array3<f32>,
     state_2: Array3<f32>,
     last_token: i32,
-    /// Each entry is (token_id, absolute_encoder_frame).
-    accumulated_tokens: Vec<(usize, usize)>,
+    /// Each entry is (token_id, absolute_encoder_frame, confidence).
+    accumulated_tokens: Vec<(usize, usize, f32)>,
     speaker_id: usize,
 }
 
@@ -96,6 +98,19 @@ pub struct SpeakerTranscript {
     pub speaker_id: usize,
     pub text: String,
     pub words: Vec<WordTimestamp>,
+}
+
+/// Result of processing one audio chunk, including transcripts and diarization.
+#[derive(Debug, Clone)]
+pub struct ChunkResult {
+    /// Per-speaker text deltas for this chunk.
+    pub transcripts: Vec<SpeakerTranscript>,
+    /// Per-frame speaker activity probabilities from Sortformer.
+    /// Shape [num_frames, NUM_SPEAKERS], values in [0.0, 1.0].
+    /// Frame rate: 80ms. Frame 0 = start of the audio chunk.
+    pub speaker_activity: Vec<Vec<f32>>,
+    /// Duration in seconds of each activity frame (0.08s).
+    pub frame_duration_secs: f32,
 }
 
 /// Streaming latency mode controlling the encoder chunk size.
@@ -297,6 +312,48 @@ impl MultitalkerASR {
         self.config.chunk_size() * HOP_LENGTH
     }
 
+    /// Run Sortformer diarization on a full audio buffer independently of the
+    /// streaming ASR pipeline. Returns per-frame speaker activity at 80ms resolution.
+    ///
+    /// This is useful when you have the complete audio upfront (e.g., reprocessing)
+    /// and want higher-quality diarization than the streaming path provides
+    /// (which feeds Sortformer ~1.12s sub-chunks instead of its optimal ~10s stride).
+    ///
+    /// **Does not affect ASR state.** The Sortformer's streaming state is saved
+    /// before and restored after, so subsequent `transcribe_chunk` calls are unaffected.
+    pub fn diarize_full(&mut self, audio_16k_mono: &[f32]) -> Result<ChunkResult> {
+        if audio_16k_mono.is_empty() {
+            return Ok(ChunkResult {
+                transcripts: vec![],
+                speaker_activity: vec![],
+                frame_duration_secs: SECONDS_PER_ENCODED_FRAME,
+            });
+        }
+
+        // Save Sortformer state, run on full buffer, restore state.
+        // Uses the current streaming state (speaker cache, silence profile) so
+        // slot assignments match the streaming path — slot 0 stays the same person.
+        // Do NOT reset_state() here — that would lose the slot→person mapping.
+        let saved_state = self.sortformer.save_state();
+
+        let result = self.sortformer.diarize_chunk_raw(audio_16k_mono);
+
+        self.sortformer.restore_state(saved_state);
+
+        let raw_preds = result?;
+        let num_frames = raw_preds.num_valid_frames.min(raw_preds.predictions.nrows());
+        let num_spk_cols = raw_preds.predictions.ncols();
+        let speaker_activity: Vec<Vec<f32>> = (0..num_frames)
+            .map(|t| (0..num_spk_cols).map(|s| raw_preds.predictions[[t, s]]).collect())
+            .collect();
+
+        Ok(ChunkResult {
+            transcripts: vec![],
+            speaker_activity,
+            frame_duration_secs: SECONDS_PER_ENCODED_FRAME,
+        })
+    }
+
     /// Get accumulated per-speaker transcripts.
     pub fn get_transcripts(&self) -> Vec<SpeakerTranscript> {
         self.speakers
@@ -305,8 +362,8 @@ impl MultitalkerASR {
                 let valid_ids: Vec<usize> = spk
                     .accumulated_tokens
                     .iter()
-                    .filter(|&&(t, _)| t < VOCAB_SIZE)
-                    .map(|&(t, _)| t)
+                    .filter(|&&(t, _, _)| t < VOCAB_SIZE)
+                    .map(|&(t, _, _)| t)
                     .collect();
                 let words = self.tokens_to_words(&spk.accumulated_tokens);
                 SpeakerTranscript {
@@ -323,11 +380,29 @@ impl MultitalkerASR {
     /// Returns per-speaker text deltas for this chunk. Speakers are created
     /// automatically when first detected.
     pub fn transcribe_chunk(&mut self, audio_chunk: &[f32]) -> Result<Vec<SpeakerTranscript>> {
+        let result = self.transcribe_chunk_inner(audio_chunk)?;
+        Ok(result.transcripts)
+    }
+
+    /// Process one audio chunk, returning transcripts and Sortformer speaker activity.
+    ///
+    /// Same as [`transcribe_chunk`] but also returns per-frame speaker activity
+    /// probabilities from Sortformer. Each frame is 80ms. Use this to determine
+    /// which speaker is active at any point in the chunk.
+    pub fn transcribe_chunk_with_activity(&mut self, audio_chunk: &[f32]) -> Result<ChunkResult> {
+        self.transcribe_chunk_inner(audio_chunk)
+    }
+
+    fn transcribe_chunk_inner(&mut self, audio_chunk: &[f32]) -> Result<ChunkResult> {
         self.audio_buffer.extend_from_slice(audio_chunk);
 
         let total_audio = self.audio_buffer.len();
         if total_audio < WIN_LENGTH {
-            return Ok(vec![]);
+            return Ok(ChunkResult {
+                transcripts: vec![],
+                speaker_activity: vec![],
+                frame_duration_secs: SECONDS_PER_ENCODED_FRAME,
+            });
         }
 
         // Compute mel over full buffer
@@ -338,7 +413,11 @@ impl MultitalkerASR {
         let chunk_size = self.config.chunk_size();
         let available_new_frames = total_mel_frames.saturating_sub(processed_mel_frames);
         if available_new_frames < chunk_size {
-            return Ok(vec![]);
+            return Ok(ChunkResult {
+                transcripts: vec![],
+                speaker_activity: vec![],
+                frame_duration_secs: SECONDS_PER_ENCODED_FRAME,
+            });
         }
 
         // Get raw diarisation predictions from Sortformer.
@@ -348,6 +427,14 @@ impl MultitalkerASR {
         // and run ASR sub-chunks against the resulting predictions.
         let raw_preds = self.sortformer.diarize_chunk_raw(audio_chunk)?;
         let diar_preds = &raw_preds.predictions;
+
+        // Convert diarization predictions to Vec<Vec<f32>> for the caller.
+        // Outer vec = frames, inner vec = per-speaker probabilities.
+        let num_frames = raw_preds.num_valid_frames.min(diar_preds.nrows());
+        let num_spk_cols = diar_preds.ncols();
+        let speaker_activity: Vec<Vec<f32>> = (0..num_frames)
+            .map(|t| (0..num_spk_cols).map(|s| diar_preds[[t, s]]).collect())
+            .collect();
 
         // Determine active speakers
         let mut active_speakers = Vec::new();
@@ -410,11 +497,11 @@ impl MultitalkerASR {
                 enc_len as usize,
                 chunk_frame_offset,
             )?;
-            self.speakers[spk_idx].accumulated_tokens.extend(&tokens);
+            self.speakers[spk_idx].accumulated_tokens.extend(tokens.iter().copied());
 
             // Build text delta and word timestamps for this chunk's tokens
             let mut text = String::new();
-            for &(t, _) in &tokens {
+            for &(t, _, _) in &tokens {
                 if t < VOCAB_SIZE {
                     text.push_str(&self.vocab.decode_single(t));
                 }
@@ -443,7 +530,11 @@ impl MultitalkerASR {
             self.audio_processed -= actual_remove;
         }
 
-        Ok(results)
+        Ok(ChunkResult {
+            transcripts: results,
+            speaker_activity,
+            frame_duration_secs: SECONDS_PER_ENCODED_FRAME,
+        })
     }
 
     /// Non-streaming transcription of an audio file.
@@ -596,7 +687,7 @@ impl MultitalkerASR {
         encoder_out: &Array3<f32>,
         enc_frames: usize,
         chunk_frame_offset: usize,
-    ) -> Result<Vec<(usize, usize)>> {
+    ) -> Result<Vec<(usize, usize, f32)>> {
         let mut tokens = Vec::new();
         let hidden_dim = encoder_out.shape()[1];
 
@@ -617,13 +708,21 @@ impl MultitalkerASR {
                     &self.speakers[spk_idx].state_2,
                 )?;
 
-                let (max_idx, _) = crate::tensor_utils::argmax_f32(logits.iter().copied());
+                let (max_idx, max_val) = crate::tensor_utils::argmax_f32(logits.iter().copied());
 
                 if max_idx == BLANK_ID {
                     break;
                 }
 
-                tokens.push((max_idx, absolute_frame));
+                // Compute softmax probability for the chosen token.
+                let log_sum_exp = {
+                    let max_for_stability = max_val;
+                    let sum: f32 = logits.iter().map(|&v| (v - max_for_stability).exp()).sum();
+                    max_for_stability + sum.ln()
+                };
+                let confidence = (max_val - log_sum_exp).exp();
+
+                tokens.push((max_idx, absolute_frame, confidence));
                 self.speakers[spk_idx].last_token = max_idx as i32;
                 self.speakers[spk_idx].state_1 = new_state_1;
                 self.speakers[spk_idx].state_2 = new_state_2;
@@ -634,14 +733,32 @@ impl MultitalkerASR {
     }
 
     /// Convert (token_id, absolute_frame) pairs into word-level timestamps.
-    fn tokens_to_words(&self, tokens: &[(usize, usize)]) -> Vec<WordTimestamp> {
-        let timed: Vec<TimedToken> = tokens
+    ///
+    /// Token end time = next token's start (spans the full inter-token gap),
+    /// with a 1-frame fallback for the last token. This gives more accurate
+    /// word boundaries than a fixed 80ms per token.
+    fn tokens_to_words(&self, tokens: &[(usize, usize, f32)]) -> Vec<WordTimestamp> {
+        let filtered: Vec<(usize, usize, f32)> = tokens
             .iter()
-            .filter(|(id, _)| *id < VOCAB_SIZE)
-            .map(|&(id, frame)| TimedToken {
-                text: self.vocab.decode_single(id),
-                start: frame as f32 * SECONDS_PER_ENCODED_FRAME,
-                end: (frame + 1) as f32 * SECONDS_PER_ENCODED_FRAME,
+            .filter(|(id, _, _)| *id < VOCAB_SIZE)
+            .copied()
+            .collect();
+        let timed: Vec<TimedToken> = filtered
+            .iter()
+            .enumerate()
+            .map(|(i, &(id, frame, conf))| {
+                let start = frame as f32 * SECONDS_PER_ENCODED_FRAME;
+                let end = if i + 1 < filtered.len() {
+                    filtered[i + 1].1 as f32 * SECONDS_PER_ENCODED_FRAME
+                } else {
+                    (frame + 1) as f32 * SECONDS_PER_ENCODED_FRAME
+                };
+                TimedToken {
+                    text: self.vocab.decode_single(id),
+                    start,
+                    end,
+                    confidence: conf,
+                }
             })
             .collect();
 
@@ -651,6 +768,7 @@ impl MultitalkerASR {
                 word: t.text,
                 start_secs: t.start,
                 end_secs: t.end,
+                confidence: t.confidence,
             })
             .collect()
     }
@@ -741,7 +859,7 @@ impl Transcriber for MultitalkerASR {
                 chunk_idx * self.config.latency_mode.encoded_frames();
             let tokens =
                 self.decode_chunk_for_speaker(0, &encoded, enc_len as usize, chunk_frame_offset)?;
-            self.speakers[0].accumulated_tokens.extend(tokens);
+            self.speakers[0].accumulated_tokens.extend(tokens.iter().copied());
 
             buffer_idx += chunk_size;
             chunk_idx += 1;
@@ -750,8 +868,8 @@ impl Transcriber for MultitalkerASR {
         let valid_ids: Vec<usize> = self.speakers[0]
             .accumulated_tokens
             .iter()
-            .filter(|&&(t, _)| t < VOCAB_SIZE)
-            .map(|&(t, _)| t)
+            .filter(|&&(t, _, _)| t < VOCAB_SIZE)
+            .map(|&(t, _, _)| t)
             .collect();
 
         let text = self.vocab.decode(&valid_ids);

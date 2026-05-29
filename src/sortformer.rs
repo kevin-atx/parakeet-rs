@@ -185,6 +185,18 @@ pub struct RawDiarizationPredictions {
 }
 
 /// Streaming Sortformer v2 speaker diarization engine
+/// Saved Sortformer streaming state for save/restore around independent diarization passes.
+pub struct SortformerState {
+    spkcache: Array3<f32>,
+    spkcache_preds: Option<Array3<f32>>,
+    fifo: Array3<f32>,
+    fifo_preds: Array3<f32>,
+    mean_sil_emb: Array2<f32>,
+    n_sil_frames: usize,
+    audio_buffer: Vec<f32>,
+    elapsed_samples: usize,
+}
+
 pub struct Sortformer {
     session: Session,
     config: DiarizationConfig,
@@ -285,6 +297,32 @@ impl Sortformer {
         self.n_sil_frames = 0;
         self.audio_buffer.clear();
         self.elapsed_samples = 0;
+    }
+
+    /// Save all streaming state so it can be restored after an independent diarization pass.
+    pub fn save_state(&self) -> SortformerState {
+        SortformerState {
+            spkcache: self.spkcache.clone(),
+            spkcache_preds: self.spkcache_preds.clone(),
+            fifo: self.fifo.clone(),
+            fifo_preds: self.fifo_preds.clone(),
+            mean_sil_emb: self.mean_sil_emb.clone(),
+            n_sil_frames: self.n_sil_frames,
+            audio_buffer: self.audio_buffer.clone(),
+            elapsed_samples: self.elapsed_samples,
+        }
+    }
+
+    /// Restore previously saved streaming state.
+    pub fn restore_state(&mut self, state: SortformerState) {
+        self.spkcache = state.spkcache;
+        self.spkcache_preds = state.spkcache_preds;
+        self.fifo = state.fifo;
+        self.fifo_preds = state.fifo_preds;
+        self.mean_sil_emb = state.mean_sil_emb;
+        self.n_sil_frames = state.n_sil_frames;
+        self.audio_buffer = state.audio_buffer;
+        self.elapsed_samples = state.elapsed_samples;
     }
 
     /// Main diarization entry point
