@@ -71,3 +71,7 @@ multitalker = ["sortformer"]
 cohere = []
 load-dynamic = ["ort/load-dynamic"]
 preload-dylibs = ["ort/preload-dylibs"]
+
+[[example]]
+name = "coreml_smoke"
+path = "examples/coreml_smoke.rs"

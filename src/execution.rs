@@ -178,14 +178,31 @@ impl ModelConfig {
 
             #[cfg(feature = "coreml")]
             ExecutionProvider::CoreML => {
-                use ort::ep::coreml::{ComputeUnits, CoreML};
+                use ort::ep::coreml::{ComputeUnits, CoreML, ModelFormat};
                 let units = match self.coreml_compute_units {
                     CoreMLComputeUnits::All => ComputeUnits::All,
                     CoreMLComputeUnits::CpuAndNeuralEngine => ComputeUnits::CPUAndNeuralEngine,
                     CoreMLComputeUnits::CpuAndGpu => ComputeUnits::CPUAndGPU,
                     CoreMLComputeUnits::CpuOnly => ComputeUnits::CPUOnly,
                 };
-                let mut coreml = CoreML::default().with_compute_units(units);
+                // MLProgram, not ORT's default NeuralNetwork.
+                //
+                // The legacy NeuralNetwork format (CoreML 3) cannot convert
+                // this model: every chunk fails at
+                //   Where node '/encoder/layers.10/self_attn/Where_1'
+                //   Status Message: GetElementType is not implemented
+                // Measured 2026-07-21 on macOS 26.5 / M1 Pro: 0 chunks
+                // transcribed and ~11,900 consecutive failures across both
+                // CoreMLComputeUnits::All and CPUAndNeuralEngine, while the
+                // CPU EP handled the same audio with zero failures. So CoreML
+                // was not slow — it was entirely non-functional.
+                //
+                // MLProgram (CoreML 5 / macOS 12+) supports a wider operator
+                // and type set, which is the documented remedy for exactly
+                // this class of conversion gap.
+                let mut coreml = CoreML::default()
+                    .with_compute_units(units)
+                    .with_model_format(ModelFormat::MLProgram);
 
                 if let Some(cache_dir) = &self.coreml_cache_dir {
                     coreml = coreml.with_model_cache_dir(cache_dir.to_string_lossy());
