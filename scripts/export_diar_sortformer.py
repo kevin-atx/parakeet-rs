@@ -55,7 +55,11 @@ model.forward = types.MethodType(onnx_forward, model)
 
 batch_size = 1
 subsampling = 8
-chunk_frames_in = args.chunk_len * subsampling
+# The runtime (sortformer.rs) feeds (chunk_len + right_context) * subsampling
+# mel frames per step — right_context rides along as lookahead and its
+# predictions are discarded after inference. Sizing the example without it
+# bakes a static graph 8 frames too small (992 vs the 1000 actually fed).
+chunk_frames_in = (args.chunk_len + args.right_context) * subsampling
 
 chunk = torch.randn(batch_size, chunk_frames_in, FEAT_DIM)
 chunk_lengths = torch.tensor([chunk_frames_in], dtype=torch.long)
