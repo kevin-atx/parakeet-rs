@@ -475,6 +475,8 @@ impl MultitalkerASR {
     fn transcribe_chunk_inner(&mut self, audio_chunk: &[f32]) -> Result<ChunkResult> {
         self.audio_buffer.extend_from_slice(audio_chunk);
 
+        let t_call = std::time::Instant::now();
+
         // Feed the diarizer at its NATIVE stride (~10s windows), decoupled
         // from the ASR sub-chunk rate (~1.12s). Sortformer zero-pads short
         // inputs to a full stride window internally, so the old
@@ -483,7 +485,9 @@ impl MultitalkerASR {
         // in `diar_preds` as strides complete; sub-chunks ahead of the last
         // completed stride use one provisional peek per call (state-saved,
         // so the same audio is re-processed authoritatively later).
+        let t = std::time::Instant::now();
         let new_raw = self.sortformer.feed_raw(audio_chunk)?;
+        let t_sortformer = t.elapsed();
         for row in new_raw.predictions.rows() {
             let mut frame = [0.0f32; NUM_SPEAKERS];
             for s in 0..NUM_SPEAKERS.min(row.len()) {
@@ -503,7 +507,9 @@ impl MultitalkerASR {
 
         // Compute mel ONCE over the full buffer; every ready sub-chunk in
         // this call indexes into it.
+        let t = std::time::Instant::now();
         let full_mel = self.compute_mel_spectrogram(&self.audio_buffer)?;
+        let t_mel = t.elapsed();
         let total_mel_frames = full_mel.shape()[1];
 
         let chunk_size = self.config.chunk_size();
@@ -522,6 +528,14 @@ impl MultitalkerASR {
         let mut provisional: Option<Array2<f32>> = None;
         let mut speaker_activity: Vec<Vec<f32>> = Vec::new();
 
+        // Per-call stage timing, printed when PARAKEET_STAGE_TIMING is set.
+        // Answers "where does feed time actually go" (sortformer vs encoder
+        // vs decode) without a profiler; ~ns overhead when unset.
+        let stage_timing = std::env::var("PARAKEET_STAGE_TIMING").is_ok();
+        let mut t_peek = std::time::Duration::ZERO;
+        let mut t_encoder = std::time::Duration::ZERO;
+        let mut t_decode = std::time::Duration::ZERO;
+
         // Process ALL ready ASR sub-chunks (a 30s caller does ~26 here; a
         // 1.12s streaming caller does one, exactly as before).
         loop {
@@ -538,7 +552,9 @@ impl MultitalkerASR {
             let f_end = f_start + enc_frames;
             let covered = self.diar_pred_offset + self.diar_preds.len();
             if f_end > covered && provisional.is_none() {
+                let t = std::time::Instant::now();
                 provisional = Some(self.sortformer.peek_buffered_raw()?.predictions);
+                t_peek += t.elapsed();
             }
             let window = assemble_diar_window(
                 &self.diar_preds,
@@ -590,6 +606,7 @@ impl MultitalkerASR {
                     .unwrap();
 
                 // Run encoder with this speaker's targets and cache
+                let t = std::time::Instant::now();
                 let (encoded, enc_len, new_cache) = self.model.run_encoder(
                     &mel_chunk,
                     chunk_length as i64,
@@ -597,15 +614,18 @@ impl MultitalkerASR {
                     &spk_targets,
                     &bg_spk_targets,
                 )?;
+                t_encoder += t.elapsed();
                 self.speakers[spk_idx].encoder_cache = new_cache;
 
                 // Decode tokens for this speaker
+                let t = std::time::Instant::now();
                 let tokens = self.decode_chunk_for_speaker(
                     spk_idx,
                     &encoded,
                     enc_len as usize,
                     chunk_frame_offset,
                 )?;
+                t_decode += t.elapsed();
                 self.speakers[spk_idx]
                     .accumulated_tokens
                     .extend(tokens.iter().copied());
@@ -670,6 +690,18 @@ impl MultitalkerASR {
                     words,
                 });
             }
+        }
+
+        if stage_timing {
+            eprintln!(
+                "STAGE_TIMING call={:.0}ms sortformer={:.0}ms peek={:.0}ms mel={:.0}ms encoder={:.0}ms decode={:.0}ms",
+                t_call.elapsed().as_secs_f64() * 1e3,
+                t_sortformer.as_secs_f64() * 1e3,
+                t_peek.as_secs_f64() * 1e3,
+                t_mel.as_secs_f64() * 1e3,
+                t_encoder.as_secs_f64() * 1e3,
+                t_decode.as_secs_f64() * 1e3,
+            );
         }
 
         Ok(ChunkResult {
