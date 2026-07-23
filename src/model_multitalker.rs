@@ -85,8 +85,23 @@ impl MultitalkerModel {
             }
         };
 
-        let encoder = exec_config.build_session(&encoder_path)?;
-        let decoder_joint = exec_config.build_session(&decoder_path)?;
+        // Bisect hook: PARAKEET_COREML_ONLY=encoder|decoder restricts the
+        // requested (non-CPU) provider to that single session; the other one
+        // runs the plain CPU EP. Diagnostic aid for isolating which session a
+        // provider miscompiles — e.g. the 2026-07-22 case where the MLProgram
+        // CoreML build executed cleanly but transcribed nothing.
+        let cpu_config = ExecutionConfig {
+            execution_provider: crate::execution::ExecutionProvider::Cpu,
+            ..exec_config.clone()
+        };
+        let (enc_config, dec_config) = match std::env::var("PARAKEET_COREML_ONLY").as_deref() {
+            Ok("encoder") => (exec_config.clone(), cpu_config),
+            Ok("decoder") => (cpu_config, exec_config.clone()),
+            _ => (exec_config.clone(), exec_config),
+        };
+
+        let encoder = enc_config.build_session(&encoder_path)?;
+        let decoder_joint = dec_config.build_session(&decoder_path)?;
 
         Ok(Self {
             encoder,
