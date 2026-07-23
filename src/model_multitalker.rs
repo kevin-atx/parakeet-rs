@@ -54,19 +54,36 @@ impl MultitalkerModel {
     ) -> Result<Self> {
         let model_dir = model_dir.as_ref();
 
-        // Prefer int8 models if available
+        #[cfg(feature = "coreml")]
+        let is_coreml =
+            exec_config.execution_provider == crate::execution::ExecutionProvider::CoreML;
+        #[cfg(not(feature = "coreml"))]
+        let is_coreml = false;
+
+        // Encoder file preference is EP-aware. The int8 export is fastest on
+        // the CPU EP, but its DynamicQuantizeLinear/MatMulInteger clusters are
+        // unsupported by CoreML — the graph shatters into ~300 partitions and
+        // runs SLOWER than CPU. The fp16 export (produced by
+        // scripts/make_multitalker_coreml_fp16.py: dequantized weights,
+        // Where-masking rewritten to arithmetic, no-op Slice removed) compiles
+        // to ~4 CoreML partitions and beats int8-CPU while freeing the CPU.
         let encoder_path = {
+            let fp16 = model_dir.join("encoder.fp16.onnx");
             let int8 = model_dir.join("encoder.int8.onnx");
             let fp32 = model_dir.join("encoder.onnx");
-            if int8.exists() {
-                int8
-            } else if fp32.exists() {
-                fp32
+            let order = if is_coreml {
+                [&fp16, &int8, &fp32]
             } else {
-                return Err(Error::Config(format!(
-                    "Missing encoder.onnx or encoder.int8.onnx in {}",
-                    model_dir.display()
-                )));
+                [&int8, &fp32, &fp16]
+            };
+            match order.iter().find(|p| p.exists()) {
+                Some(p) => (*p).clone(),
+                None => {
+                    return Err(Error::Config(format!(
+                        "Missing encoder.fp16.onnx, encoder.int8.onnx or encoder.onnx in {}",
+                        model_dir.display()
+                    )))
+                }
             }
         };
 
@@ -85,11 +102,15 @@ impl MultitalkerModel {
             }
         };
 
-        // Bisect hook: PARAKEET_COREML_ONLY=encoder|decoder restricts the
-        // requested (non-CPU) provider to that single session; the other one
-        // runs the plain CPU EP. Diagnostic aid for isolating which session a
-        // provider miscompiles — e.g. the 2026-07-22 case where the MLProgram
-        // CoreML build executed cleanly but transcribed nothing.
+        // Under CoreML the DECODER stays on the CPU EP by default: it's a
+        // tiny per-token LSTM step (DynamicQuantizeLSTM, unsupported by
+        // CoreML anyway) called up to 10x per encoded frame, so per-dispatch
+        // EP overhead swamps any compute win. CoreML accelerates the encoder,
+        // which is where ~all the FLOPs live.
+        //
+        // PARAKEET_COREML_ONLY=encoder|decoder|both overrides the split for
+        // diagnostics — e.g. the 2026-07-22 bisect that isolated the Apple
+        // transpose+identity-slice miscompilation to the encoder session.
         let cpu_config = ExecutionConfig {
             execution_provider: crate::execution::ExecutionProvider::Cpu,
             ..exec_config.clone()
@@ -97,6 +118,8 @@ impl MultitalkerModel {
         let (enc_config, dec_config) = match std::env::var("PARAKEET_COREML_ONLY").as_deref() {
             Ok("encoder") => (exec_config.clone(), cpu_config),
             Ok("decoder") => (cpu_config, exec_config.clone()),
+            Ok("both") => (exec_config.clone(), exec_config),
+            _ if is_coreml => (exec_config.clone(), cpu_config),
             _ => (exec_config.clone(), exec_config),
         };
 
