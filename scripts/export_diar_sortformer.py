@@ -8,6 +8,7 @@ parser.add_argument("--right-context", help = "The number of future frames attac
 parser.add_argument("--fifo-len", help = "The number of previous frames attached before the chunk, from the FIFO queue.", type=int, default=124)
 parser.add_argument("--spkcache-update-period", help = "The number of frames extracted from the FIFO queue to update the speaker cache.", type=int, default=144)
 parser.add_argument("--spkcache-len", help = "The total number of frames in the speaker cache.", type=int, default=188)
+parser.add_argument("--static", action="store_true", help = "Export with fixed shapes (no dynamic_axes) — required for CoreML.")
 
 args = parser.parse_args()
 
@@ -69,19 +70,21 @@ print(f"  chunk    {chunk.shape}")
 print(f"  spkcache: {spkcache.shape}")
 print(f"  fif:     {fifo.shape}")
 
+dynamic_axes = None if args.static else {
+    "chunk": {0: "batch", 1: "time_chunk"},
+    "spkcache": {0: "batch", 1: "time_cache"},
+    "fifo": {0: "batch", 1: "time_fifo"},
+    "spkcache_fifo_chunk_preds": {0: "batch", 1: "time_out"},
+    "chunk_pre_encode_embs": {0: "batch", 1: "time_pre_encode"}
+}
+
 torch.onnx.export(
     model,
     input_example,
     args.output_path,
     input_names=["chunk", "chunk_lengths", "spkcache", "spkcache_lengths", "fifo", "fifo_lengths"],
     output_names=["spkcache_fifo_chunk_preds", "chunk_pre_encode_embs", "chunk_pre_encode_lengths"],
-    dynamic_axes={
-        "chunk": {0: "batch", 1: "time_chunk"},
-        "spkcache": {0: "batch", 1: "time_cache"},
-        "fifo": {0: "batch", 1: "time_fifo"},
-        "spkcache_fifo_chunk_preds": {0: "batch", 1: "time_out"},
-        "chunk_pre_encode_embs": {0: "batch", 1: "time_pre_encode"}
-    },
+    dynamic_axes=dynamic_axes,
     opset_version=17,
     dynamo=False,
     verbose=False,
