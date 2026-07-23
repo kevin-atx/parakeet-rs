@@ -241,6 +241,25 @@ impl MultitalkerASR {
         let vocab = SentencePieceVocab::from_file(asr_dir.join("tokenizer.model"))?;
 
         let model = MultitalkerModel::from_pretrained(asr_dir, exec.clone())?;
+
+        // CoreML never helps the Sortformer: its streaming state (spkcache/
+        // fifo) grows call-to-call, so a static export is rejected at the
+        // first inference ("Got: 0 Expected: 188") and a dynamic one cannot
+        // be compiled for ANE/GPU — MLProgram rejects unbounded dimensions
+        // outright, and the legacy format claimed nodes only to run them on
+        // CPU with partitioning overhead. Pin the diarizer to the plain CPU
+        // EP; the ASR encoder/decoder sessions above keep the requested
+        // provider, which is where the static-shape CoreML win lives.
+        #[cfg(feature = "coreml")]
+        let exec = if exec.execution_provider == crate::execution::ExecutionProvider::CoreML {
+            ExecutionConfig {
+                execution_provider: crate::execution::ExecutionProvider::Cpu,
+                ..exec
+            }
+        } else {
+            exec
+        };
+
         let sortformer = Sortformer::with_config(
             sortformer_model_path,
             Some(exec),
