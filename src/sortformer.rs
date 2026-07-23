@@ -463,22 +463,9 @@ impl Sortformer {
     pub fn feed(&mut self, audio_16k_mono: &[f32]) -> Result<Vec<SpeakerSegment>> {
         self.audio_buffer.extend_from_slice(audio_16k_mono);
 
-        let feed_size = (self.chunk_len + self.right_context) * SUBSAMPLING;
-        let stride_samples = self.chunk_len * SUBSAMPLING * HOP_LENGTH;
-        let feed_samples = (self.chunk_len + self.right_context) * SUBSAMPLING * HOP_LENGTH;
-
         let mut all_segments = Vec::new();
 
-        while self.audio_buffer.len() >= feed_samples {
-            let window = &self.audio_buffer[..feed_samples];
-            let features = self.extract_mel_features(window)?;
-            // STFT center=True produces feed_size+1 mel frames from feed_samples audio,
-            // so we always have enough frames: just slice to feed_size...
-            let chunk_feat = features.slice(s![.., ..feed_size, ..]).to_owned();
-            let current_len = feed_size;
-
-            let chunk_preds = self.streaming_update(&chunk_feat, current_len)?;
-
+        for (sample_offset, chunk_preds) in self.drain_ready_strides()? {
             // Apply median filtering
             let filtered_preds = if self.config.median_window > 1 {
                 self.median_filter(&chunk_preds)
@@ -487,7 +474,6 @@ impl Sortformer {
             };
 
             // Binarize with absolute sample offset
-            let sample_offset = self.elapsed_samples as u64;
             let chunk_samples = (self.chunk_len * SUBSAMPLING * HOP_LENGTH) as u64;
             let mut segments = self.binarize(&filtered_preds);
             for seg in &mut segments {
@@ -496,13 +482,90 @@ impl Sortformer {
             }
             segments.retain(|s| s.end > s.start);
             all_segments.extend(segments);
+        }
+
+        Ok(all_segments)
+    }
+
+    /// Drain complete `(chunk_len + right_context)` windows from the internal
+    /// audio buffer, running one `streaming_update` per window at the model's
+    /// native stride. Returns each stride's raw predictions (`chunk_len`
+    /// frames) with the absolute sample offset of its first frame.
+    fn drain_ready_strides(&mut self) -> Result<Vec<(u64, Array2<f32>)>> {
+        let feed_size = (self.chunk_len + self.right_context) * SUBSAMPLING;
+        let stride_samples = self.chunk_len * SUBSAMPLING * HOP_LENGTH;
+        let feed_samples = feed_size * HOP_LENGTH;
+
+        let mut strides = Vec::new();
+        while self.audio_buffer.len() >= feed_samples {
+            let window = &self.audio_buffer[..feed_samples];
+            let features = self.extract_mel_features(window)?;
+            // STFT center=True produces feed_size+1 mel frames from feed_samples audio,
+            // so we always have enough frames: just slice to feed_size...
+            let chunk_feat = features.slice(s![.., ..feed_size, ..]).to_owned();
+
+            let chunk_preds = self.streaming_update(&chunk_feat, feed_size)?;
+            strides.push((self.elapsed_samples as u64, chunk_preds));
 
             // Advance: stride by chunk_len, keep right_context overlap
             self.audio_buffer.drain(..stride_samples);
             self.elapsed_samples += stride_samples;
         }
 
-        Ok(all_segments)
+        Ok(strides)
+    }
+
+    /// Buffered streaming diarization returning raw predictions.
+    ///
+    /// Raw-prediction counterpart of [`feed`](Self::feed): buffers audio and
+    /// runs inference only when a full native-stride window has accumulated,
+    /// so — unlike [`diarize_chunk_raw`](Self::diarize_chunk_raw) — short
+    /// inputs never pay for a zero-padded full-window inference. Returns the
+    /// concatenated raw predictions of any strides that completed (possibly
+    /// zero rows while still buffering). Row 0 of the first-ever result is
+    /// frame 0 of the stream; results are contiguous across calls.
+    ///
+    /// Use [`peek_buffered_raw`](Self::peek_buffered_raw) to get provisional
+    /// predictions for the not-yet-strided remainder.
+    pub fn feed_raw(&mut self, audio_16k_mono: &[f32]) -> Result<RawDiarizationPredictions> {
+        self.audio_buffer.extend_from_slice(audio_16k_mono);
+
+        let preds: Vec<Array2<f32>> = self
+            .drain_ready_strides()?
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect();
+        let predictions = Self::concat_predictions(&preds);
+        let num_valid_frames = predictions.nrows();
+
+        Ok(RawDiarizationPredictions {
+            predictions,
+            num_valid_frames,
+        })
+    }
+
+    /// Provisional raw predictions for audio buffered by [`feed_raw`](Self::feed_raw)
+    /// that has not yet completed a native stride.
+    ///
+    /// Runs inference over the buffered remainder (zero-padded to the stride
+    /// window) with the streaming state saved before and restored after, so
+    /// the same audio is re-processed authoritatively when its stride
+    /// completes on a later `feed_raw` call. Frame 0 of the result is the
+    /// first frame after the last completed stride.
+    pub fn peek_buffered_raw(&mut self) -> Result<RawDiarizationPredictions> {
+        if self.audio_buffer.is_empty() {
+            return Ok(RawDiarizationPredictions {
+                predictions: Array2::zeros((0, NUM_SPEAKERS)),
+                num_valid_frames: 0,
+            });
+        }
+
+        let remainder = self.audio_buffer.clone();
+        let saved = self.save_state();
+        let result = self.diarize_chunk_raw(&remainder);
+        self.restore_state(saved);
+
+        result
     }
 
     /// Flush remaining buffered audio at end of stream.

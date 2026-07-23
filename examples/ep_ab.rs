@@ -10,9 +10,12 @@ same entry point the daemon uses and report the transcript + word count.
 
 Usage:
   cargo run --release --example ep_ab --features multitalker,coreml -- \
-    <audio.wav> <asr_model_dir> <sortformer.onnx> <ep>
+    <audio.wav> <asr_model_dir> <sortformer.onnx> <ep> [feed_secs]
 
   <ep> is one of: cpu | coreml-all | coreml-ane | coreml-gpu | coreml-cpuonly
+  [feed_secs] sets the feed granularity in seconds (default: one 1.12s ASR
+  sub-chunk per call, the historical pattern; pass 30 for the daemon's
+  block-per-call pattern, which lets Sortformer stride natively).
 
 The last line is machine-parseable: `WORDS: <n>`. Exit code 0 always (the
 caller judges the count); non-zero only on hard errors.
@@ -85,13 +88,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     // Same entry point as the daemon: transcribe_chunk_with_activity.
-    let chunk_samples = model.chunk_audio_samples();
+    let sub_chunk_samples = model.chunk_audio_samples();
+    let feed_samples = match args.get(5) {
+        Some(secs) => {
+            let s: f32 = secs.parse().map_err(|_| format!("bad feed_secs: {secs}"))?;
+            // Round to whole sub-chunks, like the daemon's buffer drain.
+            ((s * 16000.0) as usize / sub_chunk_samples).max(1) * sub_chunk_samples
+        }
+        None => sub_chunk_samples,
+    };
+    println!(
+        "feed granularity: {:.2}s ({} sub-chunks per call)",
+        feed_samples as f32 / 16000.0,
+        feed_samples / sub_chunk_samples
+    );
     let t1 = std::time::Instant::now();
     let mut chunks = 0usize;
-    for chunk in audio.chunks(chunk_samples) {
-        let chunk_vec = if chunk.len() < chunk_samples {
+    for chunk in audio.chunks(feed_samples) {
+        let chunk_vec = if chunk.len() < feed_samples {
+            // Pad the tail to a whole sub-chunk so nothing is left buffered.
             let mut p = chunk.to_vec();
-            p.resize(chunk_samples, 0.0);
+            let target = p.len().div_ceil(sub_chunk_samples) * sub_chunk_samples;
+            p.resize(target, 0.0);
             p
         } else {
             chunk.to_vec()
@@ -100,7 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         chunks += 1;
     }
     // Flush with silence so trailing tokens decode.
-    let flush = vec![0.0f32; chunk_samples];
+    let flush = vec![0.0f32; sub_chunk_samples];
     for _ in 0..3 {
         model.transcribe_chunk_with_activity(&flush)?;
     }

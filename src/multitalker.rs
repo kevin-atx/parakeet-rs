@@ -107,7 +107,9 @@ pub struct ChunkResult {
     pub transcripts: Vec<SpeakerTranscript>,
     /// Per-frame speaker activity probabilities from Sortformer.
     /// Shape [num_frames, NUM_SPEAKERS], values in [0.0, 1.0].
-    /// Frame rate: 80ms. Frame 0 = start of the audio chunk.
+    /// Frame rate: 80ms. Frame 0 = start of the region processed by this
+    /// call (i.e., the first sub-chunk consumed); frames are contiguous
+    /// and non-overlapping across sub-chunks.
     pub speaker_activity: Vec<Vec<f32>>,
     /// Duration in seconds of each activity frame (0.08s).
     pub frame_duration_secs: f32,
@@ -221,6 +223,53 @@ pub struct MultitalkerASR {
     audio_buffer: Vec<f32>,
     audio_processed: usize,
     chunk_idx: usize,
+    /// Authoritative Sortformer predictions from completed native strides.
+    /// Row i holds absolute 80ms frame `diar_pred_offset + i`. Consumed rows
+    /// are trimmed after each call; ASR sub-chunks ahead of the last
+    /// completed stride use a provisional peek instead (see
+    /// `transcribe_chunk_inner`).
+    diar_preds: Vec<[f32; NUM_SPEAKERS]>,
+    /// Absolute 80ms-frame index of `diar_preds[0]`.
+    diar_pred_offset: usize,
+}
+
+/// Assemble the diarization mask window for one ASR sub-chunk covering
+/// absolute 80ms frames `[f_start, f_end)`.
+///
+/// `authoritative` row i holds absolute frame `auth_offset + i` (completed
+/// Sortformer strides); `provisional` row j holds absolute frame
+/// `auth_offset + authoritative.len() + j` (a state-safe peek over the
+/// not-yet-strided tail). Frames covered by neither source are zero
+/// (treated as silence).
+fn assemble_diar_window(
+    authoritative: &[[f32; NUM_SPEAKERS]],
+    auth_offset: usize,
+    provisional: Option<&Array2<f32>>,
+    f_start: usize,
+    f_end: usize,
+) -> Array2<f32> {
+    let n = f_end.saturating_sub(f_start);
+    let covered = auth_offset + authoritative.len();
+    let mut window = Array2::zeros((n, NUM_SPEAKERS));
+
+    for i in 0..n {
+        let f = f_start + i;
+        if f >= auth_offset && f < covered {
+            let row = &authoritative[f - auth_offset];
+            for s in 0..NUM_SPEAKERS {
+                window[[i, s]] = row[s];
+            }
+        } else if let Some(p) = provisional.filter(|p| f >= covered && f - covered < p.nrows()) {
+            let pi = f - covered;
+            for s in 0..NUM_SPEAKERS.min(p.ncols()) {
+                window[[i, s]] = p[[pi, s]];
+            }
+        }
+        // Frames covered by neither source (pre-trim or beyond the peeked
+        // tail) stay zero = silence.
+    }
+
+    window
 }
 
 impl MultitalkerASR {
@@ -278,6 +327,8 @@ impl MultitalkerASR {
             audio_buffer: Vec::new(),
             audio_processed: 0,
             chunk_idx: 0,
+            diar_preds: Vec::new(),
+            diar_pred_offset: 0,
         })
     }
 
@@ -288,6 +339,8 @@ impl MultitalkerASR {
         self.audio_buffer.clear();
         self.audio_processed = 0;
         self.chunk_idx = 0;
+        self.diar_preds.clear();
+        self.diar_pred_offset = 0;
     }
 
     /// Returns the current multitalker configuration.
@@ -335,8 +388,8 @@ impl MultitalkerASR {
     /// streaming ASR pipeline. Returns per-frame speaker activity at 80ms resolution.
     ///
     /// This is useful when you have the complete audio upfront (e.g., reprocessing)
-    /// and want higher-quality diarization than the streaming path provides
-    /// (which feeds Sortformer ~1.12s sub-chunks instead of its optimal ~10s stride).
+    /// and want whole-buffer diarization in one pass, independent of the
+    /// streaming feed's stride bookkeeping.
     ///
     /// **Does not affect ASR state.** The Sortformer's streaming state is saved
     /// before and restored after, so subsequent `transcribe_chunk` calls are unaffected.
@@ -394,10 +447,17 @@ impl MultitalkerASR {
             .collect()
     }
 
-    /// Process one audio chunk in streaming mode.
+    /// Process audio in streaming mode.
     ///
-    /// Returns per-speaker text deltas for this chunk. Speakers are created
-    /// automatically when first detected.
+    /// Accepts any length: all complete ASR sub-chunks (1.12s in Normal
+    /// mode) contained in the buffered audio are processed in this call,
+    /// and any partial remainder is buffered for the next call. Passing a
+    /// large block (e.g. 30s) is significantly cheaper than the equivalent
+    /// sequence of per-sub-chunk calls, because the diarizer runs at its
+    /// native ~10s stride over the block instead of once per sub-chunk.
+    ///
+    /// Returns per-speaker text deltas for the processed region. Speakers
+    /// are created automatically when first detected.
     pub fn transcribe_chunk(&mut self, audio_chunk: &[f32]) -> Result<Vec<SpeakerTranscript>> {
         let result = self.transcribe_chunk_inner(audio_chunk)?;
         Ok(result.transcripts)
@@ -415,6 +475,23 @@ impl MultitalkerASR {
     fn transcribe_chunk_inner(&mut self, audio_chunk: &[f32]) -> Result<ChunkResult> {
         self.audio_buffer.extend_from_slice(audio_chunk);
 
+        // Feed the diarizer at its NATIVE stride (~10s windows), decoupled
+        // from the ASR sub-chunk rate (~1.12s). Sortformer zero-pads short
+        // inputs to a full stride window internally, so the old
+        // per-sub-chunk `diarize_chunk_raw` paid a full-window inference per
+        // 1.12s of audio (~9x waste). Authoritative predictions accumulate
+        // in `diar_preds` as strides complete; sub-chunks ahead of the last
+        // completed stride use one provisional peek per call (state-saved,
+        // so the same audio is re-processed authoritatively later).
+        let new_raw = self.sortformer.feed_raw(audio_chunk)?;
+        for row in new_raw.predictions.rows() {
+            let mut frame = [0.0f32; NUM_SPEAKERS];
+            for s in 0..NUM_SPEAKERS.min(row.len()) {
+                frame[s] = row[s];
+            }
+            self.diar_preds.push(frame);
+        }
+
         let total_audio = self.audio_buffer.len();
         if total_audio < WIN_LENGTH {
             return Ok(ChunkResult {
@@ -424,121 +501,127 @@ impl MultitalkerASR {
             });
         }
 
-        // Compute mel over full buffer
+        // Compute mel ONCE over the full buffer; every ready sub-chunk in
+        // this call indexes into it.
         let full_mel = self.compute_mel_spectrogram(&self.audio_buffer)?;
         let total_mel_frames = full_mel.shape()[1];
 
-        let processed_mel_frames = self.audio_processed / HOP_LENGTH;
         let chunk_size = self.config.chunk_size();
-        let available_new_frames = total_mel_frames.saturating_sub(processed_mel_frames);
-        if available_new_frames < chunk_size {
-            return Ok(ChunkResult {
-                transcripts: vec![],
-                speaker_activity: vec![],
-                frame_duration_secs: SECONDS_PER_ENCODED_FRAME,
-            });
-        }
+        let enc_frames = self.config.latency_mode.encoded_frames();
+        let expected_size = PRE_ENCODE_CACHE + chunk_size;
 
-        // Get raw diarisation predictions from Sortformer.
-        // NOTE: The ASR chunk (~1.12s in Normal mode) is smaller than Sortformer's
-        // internal stride (~10s). Sortformer pads the short input internally. A future
-        // improvement would decouple the two chunk rates: buffer audio for Sortformer
-        // and run ASR sub-chunks against the resulting predictions.
-        let raw_preds = self.sortformer.diarize_chunk_raw(audio_chunk)?;
-        let diar_preds = &raw_preds.predictions;
-
-        // Convert diarization predictions to Vec<Vec<f32>> for the caller.
-        // Outer vec = frames, inner vec = per-speaker probabilities.
-        let num_frames = raw_preds.num_valid_frames.min(diar_preds.nrows());
-        let num_spk_cols = diar_preds.ncols();
-        let speaker_activity: Vec<Vec<f32>> = (0..num_frames)
-            .map(|t| (0..num_spk_cols).map(|s| diar_preds[[t, s]]).collect())
+        // Per-speaker token counts at call start: everything appended past
+        // these marks is this call's delta. Token-level accumulation means
+        // words straddling internal sub-chunk boundaries assemble correctly.
+        let token_marks: Vec<(usize, usize)> = self
+            .speakers
+            .iter()
+            .map(|s| (s.speaker_id, s.accumulated_tokens.len()))
             .collect();
 
-        // Determine active speakers
-        let mut active_speakers = Vec::new();
-        for spk_id in 0..self.config.max_speakers {
-            if spk_id >= diar_preds.ncols() {
+        let mut provisional: Option<Array2<f32>> = None;
+        let mut speaker_activity: Vec<Vec<f32>> = Vec::new();
+
+        // Process ALL ready ASR sub-chunks (a 30s caller does ~26 here; a
+        // 1.12s streaming caller does one, exactly as before).
+        loop {
+            let processed_mel_frames = self.audio_processed / HOP_LENGTH;
+            let available_new_frames = total_mel_frames.saturating_sub(processed_mel_frames);
+            if available_new_frames < chunk_size {
                 break;
             }
-            let max_activity = (0..diar_preds.nrows())
-                .map(|t| diar_preds[[t, spk_id]])
-                .fold(0.0f32, f32::max);
-            if max_activity > self.config.activity_threshold {
-                active_speakers.push(spk_id);
+
+            // Absolute diarization frame range for this sub-chunk. Both
+            // sides use 80ms frames (SUBSAMPLING mel frames), so the
+            // mapping is exact for every latency mode.
+            let f_start = self.chunk_idx * enc_frames;
+            let f_end = f_start + enc_frames;
+            let covered = self.diar_pred_offset + self.diar_preds.len();
+            if f_end > covered && provisional.is_none() {
+                provisional = Some(self.sortformer.peek_buffered_raw()?.predictions);
             }
-        }
+            let window = assemble_diar_window(
+                &self.diar_preds,
+                self.diar_pred_offset,
+                provisional.as_ref(),
+                f_start,
+                f_end,
+            );
 
-        // Ensure speaker instances exist
-        for &spk_id in &active_speakers {
-            if !self.speakers.iter().any(|s| s.speaker_id == spk_id) {
-                self.speakers.push(SpeakerInstance::new(spk_id));
-            }
-        }
-
-        // Build encoder input chunk
-        let expected_size = PRE_ENCODE_CACHE + chunk_size;
-        let is_first_chunk = self.chunk_idx == 0;
-        let main_start = processed_mel_frames;
-
-        let mel_chunk = self.build_mel_chunk(&full_mel, main_start, is_first_chunk, expected_size)?;
-        let chunk_length = expected_size;
-
-        let chunk_frame_offset = self.chunk_idx * self.config.latency_mode.encoded_frames();
-        let mut results = Vec::new();
-
-        // For each active speaker, run encoder with speaker-specific masks
-        for &spk_id in &active_speakers {
-            // Derive spk_targets and bg_spk_targets from raw predictions
-            let (spk_targets, bg_spk_targets) =
-                self.derive_speaker_targets(diar_preds, spk_id, chunk_length)?;
-
-            let spk_idx = self
-                .speakers
-                .iter()
-                .position(|s| s.speaker_id == spk_id)
-                .unwrap();
-
-            // Run encoder with this speaker's targets and cache
-            let (encoded, enc_len, new_cache) = self.model.run_encoder(
-                &mel_chunk,
-                chunk_length as i64,
-                &self.speakers[spk_idx].encoder_cache,
-                &spk_targets,
-                &bg_spk_targets,
-            )?;
-            self.speakers[spk_idx].encoder_cache = new_cache;
-
-            // Decode tokens for this speaker
-            let tokens = self.decode_chunk_for_speaker(
-                spk_idx,
-                &encoded,
-                enc_len as usize,
-                chunk_frame_offset,
-            )?;
-            self.speakers[spk_idx].accumulated_tokens.extend(tokens.iter().copied());
-
-            // Build text delta and word timestamps for this chunk's tokens
-            let mut text = String::new();
-            for &(t, _, _) in &tokens {
-                if t < VOCAB_SIZE {
-                    text.push_str(&self.vocab.decode_single(t));
+            // Determine active speakers in this sub-chunk
+            let mut active_speakers = Vec::new();
+            for spk_id in 0..self.config.max_speakers {
+                if spk_id >= window.ncols() {
+                    break;
+                }
+                let max_activity = (0..window.nrows())
+                    .map(|t| window[[t, spk_id]])
+                    .fold(0.0f32, f32::max);
+                if max_activity > self.config.activity_threshold {
+                    active_speakers.push(spk_id);
                 }
             }
 
-            if !text.is_empty() {
-                let words = self.tokens_to_words(&tokens);
-                results.push(SpeakerTranscript {
-                    speaker_id: spk_id,
-                    text,
-                    words,
-                });
+            // Ensure speaker instances exist
+            for &spk_id in &active_speakers {
+                if !self.speakers.iter().any(|s| s.speaker_id == spk_id) {
+                    self.speakers.push(SpeakerInstance::new(spk_id));
+                }
             }
-        }
 
-        // Advance processed position
-        self.audio_processed += chunk_size * HOP_LENGTH;
-        self.chunk_idx += 1;
+            // Build encoder input chunk
+            let is_first_chunk = self.chunk_idx == 0;
+            let main_start = processed_mel_frames;
+            let mel_chunk =
+                self.build_mel_chunk(&full_mel, main_start, is_first_chunk, expected_size)?;
+            let chunk_length = expected_size;
+            let chunk_frame_offset = self.chunk_idx * enc_frames;
+
+            // For each active speaker, run encoder with speaker-specific masks
+            for &spk_id in &active_speakers {
+                // Derive spk_targets and bg_spk_targets from the mask window
+                let (spk_targets, bg_spk_targets) =
+                    self.derive_speaker_targets(&window, spk_id, chunk_length)?;
+
+                let spk_idx = self
+                    .speakers
+                    .iter()
+                    .position(|s| s.speaker_id == spk_id)
+                    .unwrap();
+
+                // Run encoder with this speaker's targets and cache
+                let (encoded, enc_len, new_cache) = self.model.run_encoder(
+                    &mel_chunk,
+                    chunk_length as i64,
+                    &self.speakers[spk_idx].encoder_cache,
+                    &spk_targets,
+                    &bg_spk_targets,
+                )?;
+                self.speakers[spk_idx].encoder_cache = new_cache;
+
+                // Decode tokens for this speaker
+                let tokens = self.decode_chunk_for_speaker(
+                    spk_idx,
+                    &encoded,
+                    enc_len as usize,
+                    chunk_frame_offset,
+                )?;
+                self.speakers[spk_idx]
+                    .accumulated_tokens
+                    .extend(tokens.iter().copied());
+            }
+
+            // Activity output: this sub-chunk's mask window (contiguous,
+            // non-overlapping across sub-chunks; frame 0 = start of the
+            // first sub-chunk processed in this call).
+            for t in 0..window.nrows() {
+                speaker_activity.push((0..window.ncols()).map(|s| window[[t, s]]).collect());
+            }
+
+            // Advance processed position
+            self.audio_processed += chunk_size * HOP_LENGTH;
+            self.chunk_idx += 1;
+        }
 
         // Trim audio buffer
         let keep_samples = (PRE_ENCODE_CACHE + chunk_size) * HOP_LENGTH + WIN_LENGTH;
@@ -547,6 +630,46 @@ impl MultitalkerASR {
             let actual_remove = remove.min(self.audio_processed);
             self.audio_buffer.drain(0..actual_remove);
             self.audio_processed -= actual_remove;
+        }
+
+        // Trim consumed diarization frames (all sub-chunks below chunk_idx
+        // are done; provisional frames beyond `covered` were never stored).
+        let consumed = self.chunk_idx * enc_frames;
+        if consumed > self.diar_pred_offset {
+            let drop = (consumed - self.diar_pred_offset).min(self.diar_preds.len());
+            self.diar_preds.drain(..drop);
+            self.diar_pred_offset += drop;
+        }
+
+        // Build per-speaker deltas for this call from tokens accumulated
+        // past the call-start marks.
+        let mut results = Vec::new();
+        for spk in &self.speakers {
+            let mark = token_marks
+                .iter()
+                .find(|(id, _)| *id == spk.speaker_id)
+                .map(|(_, n)| *n)
+                .unwrap_or(0);
+            let new_tokens = &spk.accumulated_tokens[mark..];
+            if new_tokens.is_empty() {
+                continue;
+            }
+
+            let mut text = String::new();
+            for &(t, _, _) in new_tokens {
+                if t < VOCAB_SIZE {
+                    text.push_str(&self.vocab.decode_single(t));
+                }
+            }
+
+            if !text.is_empty() {
+                let words = self.tokens_to_words(new_tokens);
+                results.push(SpeakerTranscript {
+                    speaker_id: spk.speaker_id,
+                    text,
+                    words,
+                });
+            }
         }
 
         Ok(ChunkResult {
@@ -803,6 +926,64 @@ impl MultitalkerASR {
         let mel = self.mel_basis.dot(&spec);
 
         Ok(mel.mapv(|x| (x.max(0.0) + LOG_ZERO_GUARD).ln()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn auth_rows(vals: &[f32]) -> Vec<[f32; NUM_SPEAKERS]> {
+        vals.iter().map(|&v| [v; NUM_SPEAKERS]).collect()
+    }
+
+    fn prov(vals: &[f32]) -> Array2<f32> {
+        let n = vals.len();
+        Array2::from_shape_fn((n, NUM_SPEAKERS), |(i, _)| vals[i])
+    }
+
+    #[test]
+    fn window_fully_authoritative() {
+        let auth = auth_rows(&[0.1, 0.2, 0.3, 0.4]);
+        let w = assemble_diar_window(&auth, 10, None, 11, 13);
+        assert_eq!(w.nrows(), 2);
+        assert_eq!(w[[0, 0]], 0.2);
+        assert_eq!(w[[1, 3]], 0.3);
+    }
+
+    #[test]
+    fn window_spans_authoritative_and_provisional() {
+        let auth = auth_rows(&[0.1, 0.2]); // frames 0..2
+        let p = prov(&[0.7, 0.8]); // frames 2..4
+        let w = assemble_diar_window(&auth, 0, Some(&p), 1, 4);
+        assert_eq!(w.nrows(), 3);
+        assert_eq!(w[[0, 0]], 0.2); // frame 1: authoritative
+        assert_eq!(w[[1, 0]], 0.7); // frame 2: provisional
+        assert_eq!(w[[2, 0]], 0.8); // frame 3: provisional
+    }
+
+    #[test]
+    fn window_uncovered_frames_are_zero() {
+        // No provisional and range beyond authoritative coverage → zeros
+        // (treated as silence, never a panic).
+        let auth = auth_rows(&[0.5]);
+        let w = assemble_diar_window(&auth, 0, None, 0, 3);
+        assert_eq!(w[[0, 0]], 0.5);
+        assert_eq!(w[[1, 0]], 0.0);
+        assert_eq!(w[[2, 0]], 0.0);
+
+        // Provisional shorter than needed → trailing zeros.
+        let p = prov(&[0.9]);
+        let w = assemble_diar_window(&auth, 0, Some(&p), 0, 3);
+        assert_eq!(w[[1, 0]], 0.9);
+        assert_eq!(w[[2, 0]], 0.0);
+    }
+
+    #[test]
+    fn window_empty_range() {
+        let auth = auth_rows(&[0.5]);
+        let w = assemble_diar_window(&auth, 0, None, 3, 3);
+        assert_eq!(w.nrows(), 0);
     }
 }
 
