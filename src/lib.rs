@@ -94,7 +94,10 @@ pub use parakeet_eou::{ParakeetEOU, ParakeetEOUHandle};
 pub use parakeet_unified::{ParakeetUnified, ParakeetUnifiedHandle, UnifiedStreamingConfig};
 
 #[cfg(feature = "multitalker")]
-pub use multitalker::{ChunkResult, LatencyMode, MultitalkerASR, MultitalkerConfig, SpeakerTranscript, WordTimestamp};
+pub use multitalker::{ChunkResult, FrameEmbeddings, LatencyMode, MultitalkerASR, MultitalkerConfig, SpeakerTranscript, WordTimestamp};
+
+#[cfg(feature = "sortformer")]
+pub use sortformer::{SlotProfile, EMB_DIM};
 
 #[cfg(feature = "cohere")]
 pub use cohere::CohereASR;

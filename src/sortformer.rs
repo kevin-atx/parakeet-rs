@@ -21,7 +21,7 @@
 
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig;
-use ndarray::{s, Array1, Array2, Array3, Axis};
+use ndarray::{s, Array1, Array2, Array3, ArrayView1, ArrayView2, Axis};
 use ort::session::Session;
 use realfft::RealFftPlanner;
 use std::f32::consts::PI;
@@ -42,9 +42,19 @@ const FIFO_LEN: usize = 124; // FIFO buffer length
 const SPKCACHE_LEN: usize = 188; // Speaker cache length
 const RIGHT_CONTEXT: usize = 1; // Future frames for lookahead
 const SUBSAMPLING: usize = 8; // Audio frames -> model frames
-const EMB_DIM: usize = 512; // Embedding dimension
+/// Width of the model's per-frame embedding (`chunk_pre_encode_embs`), and of
+/// every vector in the speaker cache and the silence profile.
+pub const EMB_DIM: usize = 512;
 pub const NUM_SPEAKERS: usize = 4; // Model supports 4 speakers
-const FRAME_DURATION: f32 = 0.08; // 80ms per frame
+/// Seconds of audio per model frame. One embedding and one prediction row
+/// exist per frame, so this converts between row indices and time.
+pub const FRAME_DURATION: f32 = 0.08;
+
+/// A cache frame counts towards a slot's profile only when that slot is above
+/// this probability and every other slot is below it — i.e. the frame is
+/// *exclusively* that speaker's. Overlapped frames describe two people and
+/// would blur exactly the distinction a profile exists to measure.
+const SLOT_EXCLUSIVE_THRESHOLD: f32 = 0.5;
 
 // Cache compression params (from NeMo)
 const SPKCACHE_SIL_FRAMES_PER_SPK: usize = 3;
@@ -182,6 +192,146 @@ pub struct RawDiarizationPredictions {
     pub predictions: Array2<f32>,
     /// Number of valid frames (may be <= predictions.nrows()).
     pub num_valid_frames: usize,
+    /// Per-frame model embeddings, shape [num_frames, EMB_DIM], row-aligned 1:1
+    /// with `predictions`. `None` unless
+    /// [`set_emit_frame_embeddings(true)`](Sortformer::set_emit_frame_embeddings)
+    /// was called — the model computes them either way, but retaining them
+    /// costs a copy per stride, so callers opt in.
+    ///
+    /// These are the model's `chunk_pre_encode_embs` output: the representation
+    /// the transformer consumes and the currency of the speaker cache. They are
+    /// **pre**-encoder, so unlike a speaker-verification embedding their metric
+    /// behaviour under cosine distance is not something the training objective
+    /// guarantees. Measure before relying on it.
+    pub embeddings: Option<Array2<f32>>,
+}
+
+/// Cosine similarity, `0.0` if either vector is degenerate.
+fn cosine(a: ArrayView1<f32>, b: ArrayView1<f32>) -> f32 {
+    let (na, nb) = (a.dot(&a).sqrt(), b.dot(&b).sqrt());
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        a.dot(&b) / (na * nb)
+    }
+}
+
+/// Cache rows where `speaker_id` is above `SLOT_EXCLUSIVE_THRESHOLD` and every
+/// other slot is below it.
+///
+/// `cache_rows` clamps the scan: the two arrays are grown and compressed
+/// together so they should agree, but a mismatch would index one past the end
+/// of the other.
+fn slot_member_rows_from(
+    preds: ArrayView2<f32>,
+    cache_rows: usize,
+    speaker_id: usize,
+) -> Vec<usize> {
+    if speaker_id >= NUM_SPEAKERS {
+        return Vec::new();
+    }
+    let slots = preds.ncols().min(NUM_SPEAKERS);
+    if speaker_id >= slots {
+        return Vec::new();
+    }
+    (0..preds.nrows().min(cache_rows))
+        .filter(|&t| {
+            preds[[t, speaker_id]] >= SLOT_EXCLUSIVE_THRESHOLD
+                && (0..slots).all(|s| s == speaker_id || preds[[t, s]] < SLOT_EXCLUSIVE_THRESHOLD)
+        })
+        .collect()
+}
+
+/// The cache frames belonging exclusively to one slot, shape [frames, dim].
+fn slot_members_from(
+    cache: ArrayView2<f32>,
+    preds: ArrayView2<f32>,
+    speaker_id: usize,
+) -> Array2<f32> {
+    let dim = cache.ncols();
+    let rows = slot_member_rows_from(preds, cache.nrows(), speaker_id);
+    let mut out = Array2::zeros((rows.len(), dim));
+    for (i, &t) in rows.iter().enumerate() {
+        out.slice_mut(s![i, ..]).assign(&cache.slice(s![t, ..]));
+    }
+    out
+}
+
+/// A slot the model has not used: reported rather than omitted, so callers can
+/// index `slot_profiles()` by slot id. `dim` keeps the placeholder centroid the
+/// same width as the real ones.
+fn empty_profile(speaker_id: usize, dim: usize) -> SlotProfile {
+    SlotProfile {
+        speaker_id,
+        frames: 0,
+        centroid: Array1::zeros(dim),
+        mean_cosine: 0.0,
+        min_cosine: 0.0,
+    }
+}
+
+/// Profile every slot from a speaker cache and its labels.
+///
+/// Free function, not a method, so the selection and centroid maths are
+/// testable without an ONNX session.
+fn slot_profiles_from(cache: ArrayView2<f32>, preds: ArrayView2<f32>) -> Vec<SlotProfile> {
+    (0..NUM_SPEAKERS)
+        .map(|speaker_id| {
+            let members = slot_members_from(cache, preds, speaker_id);
+            let frames = members.nrows();
+            if frames == 0 {
+                return empty_profile(speaker_id, cache.ncols());
+            }
+
+            let mut centroid = members.sum_axis(Axis(0));
+            centroid /= frames as f32;
+            let norm = centroid.dot(&centroid).sqrt();
+            if norm > 0.0 {
+                centroid /= norm;
+            }
+
+            let (mut sum, mut min) = (0.0f32, f32::MAX);
+            for row in members.rows() {
+                let c = cosine(row, centroid.view());
+                sum += c;
+                min = min.min(c);
+            }
+
+            SlotProfile {
+                speaker_id,
+                frames,
+                centroid,
+                mean_cosine: sum / frames as f32,
+                min_cosine: min,
+            }
+        })
+        .collect()
+}
+
+/// What the speaker cache currently believes one slot sounds like.
+///
+/// Built from the frames the model itself selected and retained as that
+/// slot's exemplars, so it reports the diarizer's own notion of the speaker
+/// rather than a re-derivation from the audio.
+#[derive(Debug, Clone)]
+pub struct SlotProfile {
+    pub speaker_id: usize,
+    /// Cache frames attributed exclusively to this slot (see
+    /// `SLOT_EXCLUSIVE_THRESHOLD`). Zero for a slot the model has not used.
+    pub frames: usize,
+    /// L2-normalised mean of those frames. All-zero when `frames == 0`.
+    pub centroid: Array1<f32>,
+    /// Mean cosine of member frames to `centroid` — how tightly the slot's
+    /// exemplars agree. `0.0` when `frames == 0`.
+    pub mean_cosine: f32,
+    /// Cosine of the single most deviant member frame.
+    ///
+    /// Catches a LOPSIDED slot — a few frames of a second voice barely move
+    /// `mean_cosine` but are the minimum by construction. On an evenly split
+    /// slot the centroid sits equidistant from both voices and this equals
+    /// `mean_cosine`, so the two are worth reading together rather than
+    /// picking one.
+    pub min_cosine: f32,
 }
 
 /// Streaming Sortformer v2 speaker diarization engine
@@ -217,6 +367,11 @@ pub struct Sortformer {
     elapsed_samples: usize,
     // Mel filterbank (cached)
     mel_basis: Array2<f32>,
+    /// Retain `chunk_pre_encode_embs` and hand it back on the raw-prediction
+    /// paths. Configuration, not state: deliberately outside `SortformerState`
+    /// so a save/restore around an independent pass cannot silently turn it
+    /// off.
+    emit_embeddings: bool,
 }
 
 impl Sortformer {
@@ -276,10 +431,82 @@ impl Sortformer {
             audio_buffer: Vec::new(),
             elapsed_samples: 0,
             mel_basis,
+            emit_embeddings: false,
         };
         instance.reset_state();
         Ok(instance)
     }
+
+    /// Retain the model's per-frame embeddings and return them on the
+    /// raw-prediction paths ([`feed_raw`](Self::feed_raw),
+    /// [`peek_buffered_raw`](Self::peek_buffered_raw),
+    /// [`diarize_chunk_raw`](Self::diarize_chunk_raw)).
+    ///
+    /// Off by default. The embeddings are computed on every inference either
+    /// way — this only controls whether a copy is kept, which costs
+    /// `EMB_DIM * 4` bytes per 80ms frame (~25 KB per second of audio).
+    /// Consume them per call; accumulating a whole conversation is ~90 MB/hour.
+    ///
+    /// The binarising paths ([`diarize`](Self::diarize), [`feed`](Self::feed),
+    /// [`flush`](Self::flush)) return segments and are unaffected.
+    pub fn set_emit_frame_embeddings(&mut self, on: bool) {
+        self.emit_embeddings = on;
+    }
+
+    /// Whether per-frame embeddings are being retained.
+    pub fn emits_frame_embeddings(&self) -> bool {
+        self.emit_embeddings
+    }
+
+    /// The speaker cache's exemplar frames for one slot, shape
+    /// [frames, EMB_DIM].
+    ///
+    /// These are the frames the model selected and kept as this slot's
+    /// identity — not a re-derivation from audio, and not filtered by anything
+    /// downstream. Empty for an unused slot or before the cache first fills.
+    ///
+    /// Unlike [`set_emit_frame_embeddings`](Self::set_emit_frame_embeddings)
+    /// this needs no opt-in: the cache is maintained regardless, so reading it
+    /// costs only the copy.
+    pub fn slot_frame_embeddings(&self, speaker_id: usize) -> Array2<f32> {
+        match &self.spkcache_preds {
+            Some(p) => slot_members_from(
+                self.spkcache.slice(s![0, .., ..]),
+                p.slice(s![0, .., ..]),
+                speaker_id,
+            ),
+            None => Array2::zeros((0, EMB_DIM)),
+        }
+    }
+
+    /// Per-slot summary of the speaker cache: what each slot sounds like and
+    /// how tightly its exemplars agree.
+    ///
+    /// Always returns `NUM_SPEAKERS` entries, including unused slots
+    /// (`frames == 0`), so a caller can index by slot id without a lookup.
+    ///
+    /// `mean_cosine` and `min_cosine` are offered as a contamination signal —
+    /// a slot holding two people should show a looser cluster than one holding
+    /// one. That is a hypothesis about a **pre**-encoder representation, not a
+    /// property the model was trained to have; calibrate it against ground
+    /// truth before gating anything on it.
+    pub fn slot_profiles(&self) -> Vec<SlotProfile> {
+        match &self.spkcache_preds {
+            Some(p) => slot_profiles_from(
+                self.spkcache.slice(s![0, .., ..]),
+                p.slice(s![0, .., ..]),
+            ),
+            None => (0..NUM_SPEAKERS).map(|s| empty_profile(s, EMB_DIM)).collect(),
+        }
+    }
+
+    /// The running mean of frames the model judged to be silence, or `None`
+    /// before any have been seen. Useful as the reference "no one is talking"
+    /// point in the same space as the slot centroids.
+    pub fn silence_profile(&self) -> Option<Array1<f32>> {
+        (self.n_sil_frames > 0).then(|| self.mean_sil_emb.slice(s![0, ..]).to_owned())
+    }
+
 
     /// Streaming latency in seconds: (chunk_len + right_context) * 80ms.
     /// eg. chunk_len=124, right_context=1 -> 10.0s
@@ -353,7 +580,7 @@ impl Sortformer {
 
         // Extract mel features and run streaming inference
         let features = self.extract_mel_features(&audio)?;
-        let full_preds = self.process_features(&features)?;
+        let (full_preds, _) = self.process_features(&features)?;
 
         // Apply median filtering
         let filtered_preds = if self.config.median_window > 1 {
@@ -394,7 +621,7 @@ impl Sortformer {
         }
 
         let features = self.extract_mel_features(audio_16k_mono)?;
-        let full_preds = self.process_features(&features)?;
+        let (full_preds, _) = self.process_features(&features)?;
 
         let filtered_preds = if self.config.median_window > 1 {
             self.median_filter(&full_preds)
@@ -430,20 +657,29 @@ impl Sortformer {
         audio_16k_mono: &[f32],
     ) -> Result<RawDiarizationPredictions> {
         if audio_16k_mono.is_empty() {
-            return Ok(RawDiarizationPredictions {
-                predictions: Array2::zeros((0, NUM_SPEAKERS)),
-                num_valid_frames: 0,
-            });
+            return Ok(self.empty_raw());
         }
 
         let features = self.extract_mel_features(audio_16k_mono)?;
-        let full_preds = self.process_features(&features)?;
+        let (full_preds, embeddings) = self.process_features(&features)?;
         let num_valid_frames = full_preds.nrows();
 
         Ok(RawDiarizationPredictions {
             predictions: full_preds,
             num_valid_frames,
+            embeddings,
         })
+    }
+
+    /// A no-frames result that still honours the current emit setting, so a
+    /// caller that asked for embeddings never has to distinguish "none this
+    /// call" from "not enabled".
+    fn empty_raw(&self) -> RawDiarizationPredictions {
+        RawDiarizationPredictions {
+            predictions: Array2::zeros((0, NUM_SPEAKERS)),
+            num_valid_frames: 0,
+            embeddings: self.emit_embeddings.then(|| Array2::zeros((0, EMB_DIM))),
+        }
     }
 
     /// Feed audio samples for buffered streaming diarization.
@@ -465,7 +701,7 @@ impl Sortformer {
 
         let mut all_segments = Vec::new();
 
-        for (sample_offset, chunk_preds) in self.drain_ready_strides()? {
+        for (sample_offset, chunk_preds, _) in self.drain_ready_strides()? {
             // Apply median filtering
             let filtered_preds = if self.config.median_window > 1 {
                 self.median_filter(&chunk_preds)
@@ -490,8 +726,10 @@ impl Sortformer {
     /// Drain complete `(chunk_len + right_context)` windows from the internal
     /// audio buffer, running one `streaming_update` per window at the model's
     /// native stride. Returns each stride's raw predictions (`chunk_len`
-    /// frames) with the absolute sample offset of its first frame.
-    fn drain_ready_strides(&mut self) -> Result<Vec<(u64, Array2<f32>)>> {
+    /// frames) with the absolute sample offset of its first frame, and its
+    /// row-aligned embeddings when those are being emitted.
+    #[allow(clippy::type_complexity)]
+    fn drain_ready_strides(&mut self) -> Result<Vec<(u64, Array2<f32>, Option<Array2<f32>>)>> {
         let feed_size = (self.chunk_len + self.right_context) * SUBSAMPLING;
         let stride_samples = self.chunk_len * SUBSAMPLING * HOP_LENGTH;
         let feed_samples = feed_size * HOP_LENGTH;
@@ -504,8 +742,8 @@ impl Sortformer {
             // so we always have enough frames: just slice to feed_size...
             let chunk_feat = features.slice(s![.., ..feed_size, ..]).to_owned();
 
-            let chunk_preds = self.streaming_update(&chunk_feat, feed_size)?;
-            strides.push((self.elapsed_samples as u64, chunk_preds));
+            let (chunk_preds, chunk_embs) = self.streaming_update(&chunk_feat, feed_size)?;
+            strides.push((self.elapsed_samples as u64, chunk_preds, chunk_embs));
 
             // Advance: stride by chunk_len, keep right_context overlap
             self.audio_buffer.drain(..stride_samples);
@@ -530,17 +768,25 @@ impl Sortformer {
     pub fn feed_raw(&mut self, audio_16k_mono: &[f32]) -> Result<RawDiarizationPredictions> {
         self.audio_buffer.extend_from_slice(audio_16k_mono);
 
-        let preds: Vec<Array2<f32>> = self
-            .drain_ready_strides()?
-            .into_iter()
-            .map(|(_, p)| p)
-            .collect();
+        let strides = self.drain_ready_strides()?;
+        let n = strides.len();
+        let mut preds = Vec::with_capacity(n);
+        let mut embs = Vec::with_capacity(n);
+        for (_, p, e) in strides {
+            preds.push(p);
+            embs.extend(e);
+        }
+
         let predictions = Self::concat_predictions(&preds);
         let num_valid_frames = predictions.nrows();
+        let embeddings = self
+            .emit_embeddings
+            .then(|| Self::concat_rows(&embs, EMB_DIM));
 
         Ok(RawDiarizationPredictions {
             predictions,
             num_valid_frames,
+            embeddings,
         })
     }
 
@@ -554,10 +800,7 @@ impl Sortformer {
     /// first frame after the last completed stride.
     pub fn peek_buffered_raw(&mut self) -> Result<RawDiarizationPredictions> {
         if self.audio_buffer.is_empty() {
-            return Ok(RawDiarizationPredictions {
-                predictions: Array2::zeros((0, NUM_SPEAKERS)),
-                num_valid_frames: 0,
-            });
+            return Ok(self.empty_raw());
         }
 
         let remainder = self.audio_buffer.clone();
@@ -594,7 +837,7 @@ impl Sortformer {
             features.slice(s![.., ..feed_size, ..]).to_owned()
         };
 
-        let chunk_preds = self.streaming_update(&chunk_feat, current_len)?;
+        let (chunk_preds, _) = self.streaming_update(&chunk_feat, current_len)?;
 
         let filtered_preds = if self.config.median_window > 1 {
             self.median_filter(&chunk_preds)
@@ -618,13 +861,17 @@ impl Sortformer {
 
     /// run streaming inference over mel features, returning concatenated per chunk predictions.
     /// note: this shared by `diarize`, `diarize_chunk`, and `diarize_chunk_raw`.
-    fn process_features(&mut self, features: &Array3<f32>) -> Result<Array2<f32>> {
+    fn process_features(
+        &mut self,
+        features: &Array3<f32>,
+    ) -> Result<(Array2<f32>, Option<Array2<f32>>)> {
         let total_frames = features.shape()[1];
         let chunk_stride = self.chunk_len * SUBSAMPLING;
         let feed_size = (self.chunk_len + self.right_context) * SUBSAMPLING;
         let num_chunks = total_frames.div_ceil(chunk_stride);
 
         let mut all_chunk_preds = Vec::new();
+        let mut all_chunk_embs = Vec::new();
 
         for chunk_idx in 0..num_chunks {
             let start = chunk_idx * chunk_stride;
@@ -641,11 +888,18 @@ impl Sortformer {
                 chunk_feat = padded;
             }
 
-            let chunk_preds = self.streaming_update(&chunk_feat, current_len)?;
+            let (chunk_preds, chunk_embs) = self.streaming_update(&chunk_feat, current_len)?;
             all_chunk_preds.push(chunk_preds);
+            all_chunk_embs.extend(chunk_embs);
         }
 
-        Ok(Self::concat_predictions(&all_chunk_preds))
+        // Every stride emits embeddings or none does, so a partial collection
+        // would mean rows no longer align with predictions — refuse rather
+        // than hand back a silently misaligned matrix.
+        let embs = (self.emit_embeddings && all_chunk_embs.len() == all_chunk_preds.len())
+            .then(|| Self::concat_rows(&all_chunk_embs, EMB_DIM));
+
+        Ok((Self::concat_predictions(&all_chunk_preds), embs))
     }
 
     /// NeMo's streaming_update with smart cache compression
@@ -653,7 +907,7 @@ impl Sortformer {
         &mut self,
         chunk_feat: &Array3<f32>,
         current_len: usize,
-    ) -> Result<Array2<f32>> {
+    ) -> Result<(Array2<f32>, Option<Array2<f32>>)> {
         let spkcache_len = self.spkcache.shape()[1];
         let fifo_len = self.fifo.shape()[1];
 
@@ -749,6 +1003,11 @@ impl Sortformer {
             .to_owned();
         let chunk_embs = new_embs.slice(s![0, ..keep, ..]).to_owned();
 
+        // The caller's copy, taken before the FIFO consumes the array. Same
+        // `keep` rows as `chunk_preds`, so the two stay row-aligned by
+        // construction rather than by a later assumption.
+        let emitted = self.emit_embeddings.then(|| chunk_embs.clone());
+
         // Append chunk embeddings to FIFO
         self.fifo = Self::concat_axis1(&self.fifo, &chunk_embs.insert_axis(Axis(0)));
 
@@ -799,7 +1058,7 @@ impl Sortformer {
             }
         }
 
-        Ok(chunk_preds)
+        Ok((chunk_preds, emitted))
     }
 
     /// Update mean silence embedding
@@ -1097,14 +1356,21 @@ impl Sortformer {
 
     /// Concatenate predictions
     fn concat_predictions(preds: &[Array2<f32>]) -> Array2<f32> {
-        if preds.is_empty() {
-            return Array2::zeros((0, NUM_SPEAKERS));
+        Self::concat_rows(preds, NUM_SPEAKERS)
+    }
+
+    /// Stack row-compatible blocks, with `cols` giving the shape of the empty
+    /// result so callers get a correctly-shaped zero-row matrix rather than
+    /// having to special-case "nothing yet".
+    fn concat_rows(blocks: &[Array2<f32>], cols: usize) -> Array2<f32> {
+        if blocks.is_empty() {
+            return Array2::zeros((0, cols));
         }
-        if preds.len() == 1 {
-            return preds[0].clone();
+        if blocks.len() == 1 {
+            return blocks[0].clone();
         }
 
-        let views: Vec<_> = preds.iter().map(|p| p.view()).collect();
+        let views: Vec<_> = blocks.iter().map(|p| p.view()).collect();
         ndarray::concatenate(Axis(0), &views).unwrap()
     }
 
@@ -1339,5 +1605,118 @@ mod tests {
         let freq_bins = N_FFT / 2 + 1;
         assert_eq!(spec.shape()[0], freq_bins);
         assert!(spec.shape()[1] > 0);
+    }
+
+    /// One-hot labels: `owner[t]` is the slot active at frame t, `None` for a
+    /// frame nobody owns.
+    fn labels(owner: &[Option<usize>]) -> Array2<f32> {
+        let mut p = Array2::zeros((owner.len(), NUM_SPEAKERS));
+        for (t, o) in owner.iter().enumerate() {
+            if let Some(s) = o {
+                p[[t, *s]] = 1.0;
+            }
+        }
+        p
+    }
+
+    fn cache(rows: &[[f32; 2]]) -> Array2<f32> {
+        let mut c = Array2::zeros((rows.len(), 2));
+        for (t, r) in rows.iter().enumerate() {
+            c[[t, 0]] = r[0];
+            c[[t, 1]] = r[1];
+        }
+        c
+    }
+
+    #[test]
+    fn a_frame_two_slots_claim_belongs_to_neither_profile() {
+        // A profile says what ONE speaker sounds like. An overlapped frame
+        // describes two, so admitting it blurs exactly the distinction the
+        // profile exists to measure.
+        let mut preds = labels(&[Some(0), Some(1)]);
+        preds[[0, 1]] = 0.9; // frame 0 now claimed by slots 0 AND 1
+
+        assert!(
+            slot_member_rows_from(preds.view(), 2, 0).is_empty(),
+            "overlapped frame must not join slot 0"
+        );
+        assert_eq!(slot_member_rows_from(preds.view(), 2, 1), vec![1]);
+    }
+
+    #[test]
+    fn a_slot_holding_two_voices_reports_a_looser_cluster() {
+        // The signal this exists to provide: a slot fed from two distinct
+        // directions in embedding space should look less cohesive than one
+        // fed from a single direction.
+        let split = cache(&[[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]]);
+        let unified = cache(&[[1.0, 0.0], [0.99, 0.14], [1.0, 0.0], [0.99, 0.14]]);
+        let preds = labels(&[Some(0); 4]);
+
+        let mixed = &slot_profiles_from(split.view(), preds.view())[0];
+        let clean = &slot_profiles_from(unified.view(), preds.view())[0];
+
+        assert_eq!(mixed.frames, 4);
+        assert!(
+            mixed.mean_cosine < clean.mean_cosine,
+            "two-voice slot ({}) should be looser than one-voice slot ({})",
+            mixed.mean_cosine,
+            clean.mean_cosine
+        );
+        assert!(mixed.min_cosine < clean.min_cosine);
+
+        // An evenly split slot sits equidistant from both voices, so `min`
+        // says nothing `mean` does not. `min` earns its place on LOPSIDED
+        // splits — see the next test — not on this one.
+        assert!((mixed.min_cosine - mixed.mean_cosine).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_lopsided_slot_shows_up_in_min_cosine_before_mean_cosine() {
+        // Three frames of one voice and one of another: the interloper barely
+        // moves the mean but is the minimum by construction. This is the case
+        // a mean-only summary would wave through.
+        let lopsided = cache(&[[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]);
+        let p = &slot_profiles_from(lopsided.view(), labels(&[Some(0); 4]).view())[0];
+
+        assert!(
+            p.min_cosine < p.mean_cosine - 0.2,
+            "min {} should sit well below mean {}",
+            p.min_cosine,
+            p.mean_cosine
+        );
+    }
+
+    #[test]
+    fn every_slot_is_reported_even_when_the_model_never_used_it() {
+        // Callers index by slot id; omitting empty slots would silently
+        // shift every slot after the gap.
+        let profiles =
+            slot_profiles_from(cache(&[[1.0, 0.0]]).view(), labels(&[Some(2)]).view());
+
+        assert_eq!(profiles.len(), NUM_SPEAKERS);
+        for (i, p) in profiles.iter().enumerate() {
+            assert_eq!(p.speaker_id, i);
+        }
+        assert_eq!(profiles[2].frames, 1);
+        assert_eq!(profiles.iter().filter(|p| p.frames > 0).count(), 1);
+        // Placeholder centroids match the real ones' width.
+        assert_eq!(profiles[0].centroid.len(), profiles[2].centroid.len());
+    }
+
+    #[test]
+    fn a_labels_cache_length_mismatch_clamps_instead_of_panicking() {
+        // Compression keeps the two arrays in step, so this should not
+        // happen — but indexing one past the end of the other is a panic
+        // inside a live pipeline, and the honest response is fewer frames.
+        let preds = labels(&[Some(0); 8]);
+        assert_eq!(slot_member_rows_from(preds.view(), 3, 0), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn an_empty_result_still_has_the_embedding_width() {
+        // A caller that asked for embeddings should never have to
+        // distinguish "none this call" from "not enabled".
+        assert_eq!(Sortformer::concat_rows(&[], EMB_DIM).dim(), (0, EMB_DIM));
+        assert_eq!(Sortformer::concat_predictions(&[]).ncols(), NUM_SPEAKERS);
     }
 }

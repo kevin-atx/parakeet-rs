@@ -100,6 +100,43 @@ pub struct SpeakerTranscript {
     pub words: Vec<WordTimestamp>,
 }
 
+/// Per-frame model embeddings for a region of the stream.
+///
+/// Carries its own absolute frame index because it does **not** in general
+/// start where `ChunkResult::speaker_activity` starts: activity is emitted per
+/// ASR sub-chunk and may include provisional peek frames ahead of the
+/// diarizer, while embeddings exist only for frames the diarizer has settled
+/// authoritatively. Align on `first_frame`, never on position.
+#[derive(Debug, Clone)]
+pub struct FrameEmbeddings {
+    /// Absolute 80ms-frame index of row 0.
+    pub first_frame: usize,
+    /// Columns per row; equals [`crate::sortformer::EMB_DIM`].
+    pub dim: usize,
+    /// Row-major `[frames, dim]`.
+    pub data: Vec<f32>,
+}
+
+impl FrameEmbeddings {
+    pub fn frames(&self) -> usize {
+        if self.dim == 0 {
+            0
+        } else {
+            self.data.len() / self.dim
+        }
+    }
+
+    /// Row `i`, i.e. the embedding of absolute frame `first_frame + i`.
+    pub fn row(&self, i: usize) -> Option<&[f32]> {
+        (i < self.frames()).then(|| &self.data[i * self.dim..(i + 1) * self.dim])
+    }
+
+    /// The embedding of an absolute frame index, if this block covers it.
+    pub fn frame(&self, absolute_frame: usize) -> Option<&[f32]> {
+        self.row(absolute_frame.checked_sub(self.first_frame)?)
+    }
+}
+
 /// Result of processing one audio chunk, including transcripts and diarization.
 #[derive(Debug, Clone)]
 pub struct ChunkResult {
@@ -111,8 +148,19 @@ pub struct ChunkResult {
     /// call (i.e., the first sub-chunk consumed); frames are contiguous
     /// and non-overlapping across sub-chunks.
     pub speaker_activity: Vec<Vec<f32>>,
+    /// Absolute 80ms-frame index of `speaker_activity[0]`, so activity from
+    /// successive calls lands on one timeline and can be lined up with
+    /// `frame_embeddings`.
+    pub first_activity_frame: usize,
     /// Duration in seconds of each activity frame (0.08s).
     pub frame_duration_secs: f32,
+    /// The model's per-frame embeddings for frames the diarizer settled during
+    /// this call. `None` unless
+    /// [`set_emit_frame_embeddings(true)`](MultitalkerASR::set_emit_frame_embeddings).
+    ///
+    /// Covers a *different* frame range than `speaker_activity` — see
+    /// [`FrameEmbeddings`].
+    pub frame_embeddings: Option<FrameEmbeddings>,
 }
 
 /// Streaming latency mode controlling the encoder chunk size.
@@ -378,6 +426,25 @@ impl MultitalkerASR {
         }
     }
 
+    /// Return the diarizer's per-frame embeddings on [`ChunkResult`].
+    ///
+    /// Off by default; see
+    /// [`Sortformer::set_emit_frame_embeddings`](crate::sortformer::Sortformer::set_emit_frame_embeddings)
+    /// for what they are and what they cost.
+    pub fn set_emit_frame_embeddings(&mut self, on: bool) {
+        self.sortformer.set_emit_frame_embeddings(on);
+    }
+
+    /// What the diarizer currently believes each of its slots sounds like.
+    ///
+    /// A snapshot of live streaming state: it reflects everything fed so far
+    /// and moves on the next call, so read it at the point you mean to
+    /// describe (e.g. when a conversation ends) rather than treating it as a
+    /// property of any one chunk.
+    pub fn slot_profiles(&self) -> Vec<crate::sortformer::SlotProfile> {
+        self.sortformer.slot_profiles()
+    }
+
     /// Returns the number of audio samples the caller should provide per
     /// chunk for the current latency mode. This is `chunk_mel_frames * HOP_LENGTH`.
     pub fn chunk_audio_samples(&self) -> usize {
@@ -398,7 +465,9 @@ impl MultitalkerASR {
             return Ok(ChunkResult {
                 transcripts: vec![],
                 speaker_activity: vec![],
+                first_activity_frame: 0,
                 frame_duration_secs: SECONDS_PER_ENCODED_FRAME,
+                frame_embeddings: None,
             });
         }
 
@@ -419,10 +488,24 @@ impl MultitalkerASR {
             .map(|t| (0..num_spk_cols).map(|s| raw_preds.predictions[[t, s]]).collect())
             .collect();
 
+        // This pass re-diarises the buffer from frame 0 of the audio it was
+        // given, so both frame ranges are relative to that buffer — not to the
+        // streaming timeline the other methods report against.
+        let frame_embeddings = raw_preds.embeddings.as_ref().map(|e| FrameEmbeddings {
+            first_frame: 0,
+            dim: e.ncols(),
+            data: e.slice(s![..num_frames.min(e.nrows()), ..])
+                .iter()
+                .copied()
+                .collect(),
+        });
+
         Ok(ChunkResult {
             transcripts: vec![],
             speaker_activity,
+            first_activity_frame: 0,
             frame_duration_secs: SECONDS_PER_ENCODED_FRAME,
+            frame_embeddings,
         })
     }
 
@@ -486,8 +569,17 @@ impl MultitalkerASR {
         // completed stride use one provisional peek per call (state-saved,
         // so the same audio is re-processed authoritatively later).
         let t = std::time::Instant::now();
+        // Absolute index the diarizer's next settled frame will occupy —
+        // taken BEFORE the append below, which is what makes the embeddings
+        // block self-locating.
+        let emb_first_frame = self.diar_pred_offset + self.diar_preds.len();
         let new_raw = self.sortformer.feed_raw(audio_chunk)?;
         let t_sortformer = t.elapsed();
+        let frame_embeddings = new_raw.embeddings.as_ref().map(|e| FrameEmbeddings {
+            first_frame: emb_first_frame,
+            dim: e.ncols(),
+            data: e.iter().copied().collect(),
+        });
         for row in new_raw.predictions.rows() {
             let mut frame = [0.0f32; NUM_SPEAKERS];
             for s in 0..NUM_SPEAKERS.min(row.len()) {
@@ -501,7 +593,9 @@ impl MultitalkerASR {
             return Ok(ChunkResult {
                 transcripts: vec![],
                 speaker_activity: vec![],
+                first_activity_frame: self.chunk_idx * self.config.latency_mode.encoded_frames(),
                 frame_duration_secs: SECONDS_PER_ENCODED_FRAME,
+                frame_embeddings,
             });
         }
 
@@ -527,6 +621,9 @@ impl MultitalkerASR {
 
         let mut provisional: Option<Array2<f32>> = None;
         let mut speaker_activity: Vec<Vec<f32>> = Vec::new();
+        // Where the first sub-chunk of this call starts, before the loop
+        // advances `chunk_idx`.
+        let first_activity_frame = self.chunk_idx * enc_frames;
 
         // Per-call stage timing, printed when PARAKEET_STAGE_TIMING is set.
         // Answers "where does feed time actually go" (sortformer vs encoder
@@ -707,7 +804,9 @@ impl MultitalkerASR {
         Ok(ChunkResult {
             transcripts: results,
             speaker_activity,
+            first_activity_frame,
             frame_duration_secs: SECONDS_PER_ENCODED_FRAME,
+            frame_embeddings,
         })
     }
 
@@ -1016,6 +1115,34 @@ mod tests {
         let auth = auth_rows(&[0.5]);
         let w = assemble_diar_window(&auth, 0, None, 3, 3);
         assert_eq!(w.nrows(), 0);
+    }
+
+    #[test]
+    fn an_embedding_block_is_addressed_absolutely_not_positionally() {
+        // Embeddings and activity start at different frames in the same
+        // call, so a caller lining them up by position silently reads the
+        // wrong speaker's audio. `first_frame` is what makes that impossible.
+        let e = FrameEmbeddings {
+            first_frame: 40,
+            dim: 2,
+            data: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        };
+
+        assert_eq!(e.frames(), 3);
+        assert_eq!(e.row(0), Some(&[1.0, 2.0][..]));
+        assert_eq!(e.frame(40), Some(&[1.0, 2.0][..]));
+        assert_eq!(e.frame(42), Some(&[5.0, 6.0][..]));
+        // Outside the block in either direction, not a wrapped or clamped row.
+        assert_eq!(e.frame(39), None);
+        assert_eq!(e.frame(43), None);
+        assert_eq!(e.row(3), None);
+    }
+
+    #[test]
+    fn an_empty_embedding_block_reports_no_frames_rather_than_dividing_by_zero() {
+        let e = FrameEmbeddings { first_frame: 0, dim: 0, data: vec![] };
+        assert_eq!(e.frames(), 0);
+        assert_eq!(e.row(0), None);
     }
 }
 
