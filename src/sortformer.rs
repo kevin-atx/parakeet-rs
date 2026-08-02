@@ -46,9 +46,25 @@ const SUBSAMPLING: usize = 8; // Audio frames -> model frames
 /// every vector in the speaker cache and the silence profile.
 pub const EMB_DIM: usize = 512;
 pub const NUM_SPEAKERS: usize = 4; // Model supports 4 speakers
-/// Seconds of audio per model frame. One embedding and one prediction row
-/// exist per frame, so this converts between row indices and time.
-pub const FRAME_DURATION: f32 = 0.08;
+/// Samples of 16kHz audio per model frame — the EXACT quantity, and the one
+/// to compute with.
+///
+/// A frame is `SUBSAMPLING` mel hops, each `HOP_LENGTH` samples, so 1280
+/// exactly. Deriving it the other way round, from the float duration, is a
+/// live trap: `0.08f32` is really 0.0799999982..., widening to `f64` keeps
+/// that error, and `as usize` TRUNCATES — so
+/// `(FRAME_DURATION as f64 * 16000.0) as usize` yields **1279**. One sample
+/// short per frame is 62.5us of drift each frame, ~2.8 seconds across an
+/// hour of audio, silently misaligning frames against any other timeline.
+pub const FRAME_SAMPLES: usize = SUBSAMPLING * HOP_LENGTH;
+
+/// Seconds of audio per model frame, DERIVED from [`FRAME_SAMPLES`].
+///
+/// Convenient for reporting; do not multiply it back out to recover a sample
+/// or frame count — use [`FRAME_SAMPLES`], which is exact.
+pub const FRAME_DURATION: f32 = FRAME_SAMPLES as f32 / SAMPLE_RATE as f32;
+
+const _: () = assert!(FRAME_SAMPLES == 1280);
 
 /// A cache frame counts towards a slot's profile only when that slot is above
 /// this probability and every other slot is below it — i.e. the frame is
@@ -1405,7 +1421,7 @@ impl Sortformer {
         let pad_offset_samples = (self.config.pad_offset * SAMPLE_RATE as f32) as u64;
         let min_dur_on_samples = (self.config.min_duration_on * SAMPLE_RATE as f32) as u64;
         let min_dur_off_samples = (self.config.min_duration_off * SAMPLE_RATE as f32) as u64;
-        let samples_per_frame = (FRAME_DURATION * SAMPLE_RATE as f32) as u64;
+        let samples_per_frame = FRAME_SAMPLES as u64;
 
         for spk in 0..NUM_SPEAKERS {
             let mut in_seg = false;
