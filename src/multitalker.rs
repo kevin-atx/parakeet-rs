@@ -19,7 +19,7 @@ use crate::nemotron::SentencePieceVocab;
 use crate::sortformer::{Sortformer, NUM_SPEAKERS};
 use crate::timestamps::{self, TimestampMode};
 use crate::transcriber::Transcriber;
-use ndarray::{s, Array2, Array3};
+use ndarray::{s, Array1, Array2, Array3};
 use std::path::Path;
 
 // Reuse the same audio constants as Nemotron (same encoder architecture)
@@ -240,6 +240,15 @@ pub struct MultitalkerConfig {
     /// Streaming latency mode. Controls the encoder chunk size and
     /// therefore the latency-accuracy tradeoff.
     pub latency_mode: LatencyMode,
+
+    /// Blank-logit penalty subtracted from the RNN-T blank before the
+    /// greedy argmax (sherpa-onnx convention: `logits[blank] -= penalty`).
+    /// Positive values recover borderline words where a token narrowly
+    /// trails blank — trailing/short words are the usual casualties;
+    /// negative values boost blank, suppressing spurious emissions.
+    /// Genuine silence frames, where blank leads by a wide margin, are
+    /// unaffected. Default 0.0 = off (bit-identical stock decode).
+    pub blank_penalty: f32,
 }
 
 impl Default for MultitalkerConfig {
@@ -248,6 +257,7 @@ impl Default for MultitalkerConfig {
             max_speakers: NUM_SPEAKERS,
             activity_threshold: SPEAKER_ACTIVITY_THRESHOLD,
             latency_mode: LatencyMode::default(),
+            blank_penalty: 0.0,
         }
     }
 }
@@ -412,6 +422,13 @@ impl MultitalkerASR {
     /// speakers sooner), higher values require stronger evidence.
     pub fn set_activity_threshold(&mut self, threshold: f32) {
         self.config.activity_threshold = threshold.clamp(0.0, 1.0);
+    }
+
+    /// Blank-logit penalty: positive recovers borderline words, negative
+    /// suppresses spurious emissions. Default 0.0 = off. Takes effect on
+    /// the next decoded sub-chunk; no state reset needed.
+    pub fn set_blank_penalty(&mut self, penalty: f32) {
+        self.config.blank_penalty = penalty;
     }
 
     /// Set the streaming latency mode.
@@ -974,13 +991,14 @@ impl MultitalkerASR {
             let absolute_frame = chunk_frame_offset + t;
 
             for _ in 0..MAX_SYMBOLS_PER_STEP {
-                let (logits, new_state_1, new_state_2) = self.model.run_decoder(
+                let (mut logits, new_state_1, new_state_2) = self.model.run_decoder(
                     &frame,
                     self.speakers[spk_idx].last_token,
                     &self.speakers[spk_idx].state_1,
                     &self.speakers[spk_idx].state_2,
                 )?;
 
+                apply_blank_penalty(&mut logits, self.config.blank_penalty);
                 let (max_idx, max_val) = crate::tensor_utils::argmax_f32(logits.iter().copied());
 
                 if max_idx == BLANK_ID {
@@ -1060,12 +1078,63 @@ impl MultitalkerASR {
     }
 }
 
+/// Subtract `penalty` from the blank logit — index [`BLANK_ID`], the last
+/// of the `vocab_size + 1` joint outputs. No-op at 0.0. Applied before
+/// both the argmax and the confidence softmax, so an emitted token's
+/// confidence reflects the distribution the decode actually ran on.
+fn apply_blank_penalty(logits: &mut Array1<f32>, penalty: f32) {
+    if penalty == 0.0 {
+        return;
+    }
+    if let Some(blank_logit) = logits.get_mut(BLANK_ID) {
+        *blank_logit -= penalty;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn auth_rows(vals: &[f32]) -> Vec<[f32; NUM_SPEAKERS]> {
         vals.iter().map(|&v| [v; NUM_SPEAKERS]).collect()
+    }
+
+    // Joint output: VOCAB_SIZE tokenizer tokens (ids 0..=1023) + blank
+    // appended last at index 1024 = BLANK_ID = VOCAB_SIZE.
+    const LOGIT_WIDTH: usize = VOCAB_SIZE + 1;
+
+    // The penalty must hit blank (1024), not the last tokenizer token (1023).
+    #[test]
+    fn penalty_targets_blank_not_last_tokenizer_token() {
+        let mut v = Array1::from_elem(LOGIT_WIDTH, -20.0f32);
+        v[VOCAB_SIZE - 1] = 5.0;
+        v[BLANK_ID] = 5.0;
+        apply_blank_penalty(&mut v, 3.0);
+        assert_eq!(v[VOCAB_SIZE - 1], 5.0);
+        assert_eq!(v[BLANK_ID], 2.0);
+    }
+
+    // The 0.0 default must leave the logits bit-identical (feature off =
+    // stock decode).
+    #[test]
+    fn zero_penalty_is_a_no_op() {
+        let mut v = Array1::from_elem(LOGIT_WIDTH, -20.0f32);
+        v[300] = 6.5;
+        v[BLANK_ID] = 5.0;
+        let original = v.clone();
+        apply_blank_penalty(&mut v, 0.0);
+        assert_eq!(v, original);
+    }
+
+    // A penalized blank that still leads must still decode as blank —
+    // the knob shifts borderline frames only.
+    #[test]
+    fn wide_margin_blank_still_wins_after_penalty() {
+        let mut v = Array1::from_elem(LOGIT_WIDTH, -20.0f32);
+        v[BLANK_ID] = 10.0;
+        apply_blank_penalty(&mut v, 3.0);
+        let (max_idx, _) = crate::tensor_utils::argmax_f32(v.iter().copied());
+        assert_eq!(max_idx, BLANK_ID);
     }
 
     fn prov(vals: &[f32]) -> Array2<f32> {
