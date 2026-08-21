@@ -367,9 +367,18 @@ impl MultitalkerASR {
             exec
         };
 
+        // The Sortformer's activation shapes vary run to run (streaming
+        // state + whole-conversation diarize_full passes), which makes
+        // ORT's BFC arena accumulate 128 MB extents without bound in a
+        // long-lived process — see ModelConfig::cpu_arena. Plain malloc
+        // for this session; the packed weights are unaffected.
+        let sortformer_exec = ExecutionConfig {
+            cpu_arena: false,
+            ..exec
+        };
         let sortformer = Sortformer::with_config(
             sortformer_model_path,
-            Some(exec),
+            Some(sortformer_exec),
             crate::sortformer::DiarizationConfig::default(),
         )?;
 

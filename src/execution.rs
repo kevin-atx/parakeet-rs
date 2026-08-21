@@ -57,6 +57,18 @@ pub struct ModelConfig {
     /// Only used when execution_provider is CoreML.
     pub coreml_cache_dir: Option<PathBuf>,
     pub coreml_compute_units: CoreMLComputeUnits,
+    /// Whether the CPU execution provider uses ORT's BFC arena allocator.
+    /// Defaults to true (ORT's own default). Set FALSE for sessions whose
+    /// activation shapes VARY RUN TO RUN over a long-lived process: the BFC
+    /// arena grows in 128 MB extents, never returns memory to the OS, and
+    /// fragments under varying large requests — a daemon hosting the
+    /// streaming Sortformer accumulated ~950 such extents (118 GB virtual,
+    /// 21 GB swapped) over one 14-hour day (recogment, 2026-08-21; the
+    /// allocation stacks name BFCArena::Extend under Sortformer::streaming_update).
+    /// Note the GPU-fallback arms already register ort's `CPU` EP with its
+    /// derived default `use_arena = false`, so those paths were never affected;
+    /// only the pure-Cpu arm inherited ORT's arena-on default.
+    pub cpu_arena: bool,
 }
 
 impl fmt::Debug for ModelConfig {
@@ -75,6 +87,7 @@ impl fmt::Debug for ModelConfig {
             )
             .field("coreml_cache_dir", &self.coreml_cache_dir)
             .field("coreml_compute_units", &self.coreml_compute_units)
+            .field("cpu_arena", &self.cpu_arena)
             .finish()
     }
 }
@@ -88,6 +101,7 @@ impl Default for ModelConfig {
             configure: None,
             coreml_cache_dir: None,
             coreml_compute_units: CoreMLComputeUnits::default(),
+            cpu_arena: true,
         }
     }
 }
@@ -99,6 +113,12 @@ impl ModelConfig {
 
     pub fn with_execution_provider(mut self, provider: ExecutionProvider) -> Self {
         self.execution_provider = provider;
+        self
+    }
+
+    /// See [`ModelConfig::cpu_arena`].
+    pub fn with_cpu_arena(mut self, enable: bool) -> Self {
+        self.cpu_arena = enable;
         self
     }
 
@@ -162,7 +182,27 @@ impl ModelConfig {
             .with_inter_threads(self.inter_threads)?;
 
         builder = match self.execution_provider {
-            ExecutionProvider::Cpu => builder,
+            ExecutionProvider::Cpu => {
+                if self.cpu_arena {
+                    builder
+                } else {
+                    // Two session options, both required for a dynamic-shape
+                    // long-lived session (validated 2026-08-21 on the boundary
+                    // reproducer — the arena flag ALONE changed nothing):
+                    //  - DisableCpuMemArena: activations come from plain malloc
+                    //    and return to the OS on free;
+                    //  - memory_pattern(false): ORT otherwise caches a
+                    //    peak-sized pre-planned buffer PER DISTINCT INPUT SHAPE
+                    //    on the session (ExecutionFrame allocates it whole),
+                    //    which is unbounded when shapes vary run to run — the
+                    //    actual mechanism behind the 128 MB-per-region growth.
+                    builder
+                        .with_memory_pattern(false)?
+                        .with_execution_providers([
+                            ort::ep::CPU::default().with_arena_allocator(false).build(),
+                        ])?
+                }
+            }
 
             #[cfg(feature = "cuda")]
             ExecutionProvider::Cuda => builder.with_execution_providers([
