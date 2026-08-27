@@ -249,6 +249,17 @@ pub struct MultitalkerConfig {
     /// Genuine silence frames, where blank leads by a wide margin, are
     /// unaffected. Default 0.0 = off (bit-identical stock decode).
     pub blank_penalty: f32,
+
+    /// Sleep inserted between ready-sub-chunk iterations inside one
+    /// `transcribe_chunk()` call (between the ~1.12s encoder inferences,
+    /// never before the first). Duty-cycles the encoder so a concurrent
+    /// GPU consumer — a video call's encode pipeline — gets scheduling
+    /// gaps instead of a solid multi-second inference pulse. Purely a
+    /// timing change: the computation sequence and every output are
+    /// identical with or without it. Default None = flat-out (unchanged
+    /// behavior). A 30s caller in Normal mode does ~26 sub-chunks, so
+    /// budget `pause × 25` of added wall time per call.
+    pub inter_chunk_pause: Option<std::time::Duration>,
 }
 
 impl Default for MultitalkerConfig {
@@ -258,6 +269,7 @@ impl Default for MultitalkerConfig {
             activity_threshold: SPEAKER_ACTIVITY_THRESHOLD,
             latency_mode: LatencyMode::default(),
             blank_penalty: 0.0,
+            inter_chunk_pause: None,
         }
     }
 }
@@ -438,6 +450,14 @@ impl MultitalkerASR {
     /// the next decoded sub-chunk; no state reset needed.
     pub fn set_blank_penalty(&mut self, penalty: f32) {
         self.config.blank_penalty = penalty;
+    }
+
+    /// Pause between ready-sub-chunk inferences within one call — see
+    /// [`MultitalkerConfig::inter_chunk_pause`]. Takes effect on the next
+    /// `transcribe_chunk()` call; no state reset needed. `None` restores
+    /// flat-out processing.
+    pub fn set_inter_chunk_pause(&mut self, pause: Option<std::time::Duration>) {
+        self.config.inter_chunk_pause = pause;
     }
 
     /// Set the streaming latency mode.
@@ -661,12 +681,22 @@ impl MultitalkerASR {
 
         // Process ALL ready ASR sub-chunks (a 30s caller does ~26 here; a
         // 1.12s streaming caller does one, exactly as before).
+        let mut first_subchunk = true;
         loop {
             let processed_mel_frames = self.audio_processed / HOP_LENGTH;
             let available_new_frames = total_mel_frames.saturating_sub(processed_mel_frames);
             if available_new_frames < chunk_size {
                 break;
             }
+
+            // Optional duty-cycling between sub-chunk inferences (never
+            // before the first, never after the last — the availability
+            // check above has already committed us to processing one).
+            // See `MultitalkerConfig::inter_chunk_pause`.
+            if !first_subchunk && let Some(pause) = self.config.inter_chunk_pause {
+                std::thread::sleep(pause);
+            }
+            first_subchunk = false;
 
             // Absolute diarization frame range for this sub-chunk. Both
             // sides use 80ms frames (SUBSAMPLING mel frames), so the
