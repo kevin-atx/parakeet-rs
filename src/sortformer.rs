@@ -77,6 +77,9 @@ const PRED_SCORE_THRESHOLD: f32 = 0.25;
 const STRONG_BOOST_RATE: f32 = 0.75;
 const WEAK_BOOST_RATE: f32 = 1.5;
 const MIN_POS_SCORES_RATE: f32 = 0.5;
+/// NeMo `scores_boost_latest` (checkpoint config: 0.05) — additive edge given
+/// to freshly popped FIFO frames over old cache content during compression.
+const SCORES_BOOST_LATEST: f32 = 0.05;
 const SIL_THRESHOLD: f32 = 0.2;
 const MAX_INDEX: usize = 99999;
 
@@ -1076,30 +1079,39 @@ impl Sortformer {
         Ok((chunk_preds, emitted))
     }
 
-    /// Update mean silence embedding
+    /// Update mean silence embedding.
+    ///
+    /// NeMo's op order (`_get_silence_profile`): one batch sum over the pop's
+    /// silence frames, then a single mean-rescale — NOT a per-frame running
+    /// mean. Same math, but the per-frame version recomputes `mean * n` every
+    /// step and its rounding drift lands verbatim in cache rows (the mean
+    /// silence embedding substitutes for disabled frames), so op order is part
+    /// of parity here.
     fn update_silence_profile(&mut self, embs: &Array3<f32>, preds: &Array3<f32>) {
         let preds_2d = preds.slice(s![0, .., ..]);
 
+        let mut batch_sum = vec![0.0f32; EMB_DIM];
+        let mut batch_count = 0usize;
         for t in 0..preds_2d.shape()[0] {
             let sum: f32 = (0..NUM_SPEAKERS).map(|s| preds_2d[[t, s]]).sum();
             if sum < SIL_THRESHOLD {
-                // This is a silence frame
                 let emb = embs.slice(s![0, t, ..]);
-
-                // Update running mean
-                let old_sum: Vec<f32> = self
-                    .mean_sil_emb
-                    .slice(s![0, ..])
-                    .iter()
-                    .map(|&x| x * self.n_sil_frames as f32)
-                    .collect();
-
-                self.n_sil_frames += 1;
-
-                for i in 0..EMB_DIM {
-                    self.mean_sil_emb[[0, i]] = (old_sum[i] + emb[i]) / self.n_sil_frames as f32;
+                for (acc, &e) in batch_sum.iter_mut().zip(emb.iter()) {
+                    *acc += e;
                 }
+                batch_count += 1;
             }
+        }
+        if batch_count == 0 {
+            return;
+        }
+
+        let old_n = self.n_sil_frames as f32;
+        self.n_sil_frames += batch_count;
+        let new_n = self.n_sil_frames as f32;
+        for i in 0..EMB_DIM {
+            self.mean_sil_emb[[0, i]] =
+                (self.mean_sil_emb[[0, i]] * old_n + batch_sum[i]) / new_n;
         }
     }
 
@@ -1110,7 +1122,6 @@ impl Sortformer {
             None => return,
         };
 
-        let n_frames = self.spkcache.shape()[1];
         let per_spk = self.spkcache_len / NUM_SPEAKERS;
         if per_spk <= SPKCACHE_SIL_FRAMES_PER_SPK {
             // truncate if cache too small for compression
@@ -1120,17 +1131,42 @@ impl Sortformer {
             }
             return;
         }
-        let spkcache_len_per_spk = per_spk - SPKCACHE_SIL_FRAMES_PER_SPK;
+        let preds_2d = cache_preds.slice(s![0, .., ..]).to_owned();
+        let (topk_indices, is_disabled) = self.select_compress_frames(&preds_2d);
+
+        // Gather embeddings
+        let (new_embs, new_preds) = self.gather_spkcache(&topk_indices, &is_disabled);
+
+        self.spkcache = new_embs;
+        self.spkcache_preds = Some(new_preds);
+    }
+
+    /// The compression's frame-selection chain: quality scores → disable →
+    /// latest-boost → strong/weak boosts → silence pad → top-k. Split from
+    /// `compress_spkcache` so parity instrumentation can run the SAME chain
+    /// on a captured preds matrix (see `debug_compress_selection`).
+    fn select_compress_frames(&self, preds_2d: &Array2<f32>) -> (Vec<usize>, Vec<bool>) {
+        let n_frames = preds_2d.nrows();
+        let spkcache_len_per_spk = self.spkcache_len / NUM_SPEAKERS - SPKCACHE_SIL_FRAMES_PER_SPK;
         let strong_boost_per_spk = (spkcache_len_per_spk as f32 * STRONG_BOOST_RATE) as usize;
         let weak_boost_per_spk = (spkcache_len_per_spk as f32 * WEAK_BOOST_RATE) as usize;
         let min_pos_scores_per_spk = (spkcache_len_per_spk as f32 * MIN_POS_SCORES_RATE) as usize;
 
         // Calculate quality scores
-        let preds_2d = cache_preds.slice(s![0, .., ..]).to_owned();
-        let mut scores = self.get_log_pred_scores(&preds_2d);
+        let mut scores = self.get_log_pred_scores(preds_2d);
 
         // Disable low scores
-        scores = self.disable_low_scores(&preds_2d, scores, min_pos_scores_per_spk);
+        scores = self.disable_low_scores(preds_2d, scores, min_pos_scores_per_spk);
+
+        // Boost newly added frames (NeMo `scores_boost_latest`, checkpoint
+        // config 0.05): everything past position spkcache_len is what the FIFO
+        // just popped, and gets a small edge over old cache content. Applied
+        // unconditionally like the reference (-inf + 0.05 stays -inf).
+        for t in self.spkcache_len.min(n_frames)..n_frames {
+            for s in 0..NUM_SPEAKERS {
+                scores[[t, s]] += SCORES_BOOST_LATEST;
+            }
+        }
 
         // Boost important frames
         scores = self.boost_topk_scores(scores, strong_boost_per_spk, 2.0);
@@ -1152,31 +1188,40 @@ impl Sortformer {
         }
 
         // Select top frames
-        let (topk_indices, is_disabled) = self.get_topk_indices(&scores, n_frames);
-
-        // Gather embeddings
-        let (new_embs, new_preds) = self.gather_spkcache(&topk_indices, &is_disabled);
-
-        self.spkcache = new_embs;
-        self.spkcache_preds = Some(new_preds);
+        self.get_topk_indices(&scores, n_frames)
     }
 
-    /// Calculate quality scores
+    /// Parity instrumentation: run the production frame-selection chain on a
+    /// captured preds matrix (n_frames x NUM_SPEAKERS) and return the chosen
+    /// frame indices + disabled mask, for comparison against NeMo's
+    /// `_compress_spkcache` selection on identical input.
+    pub fn debug_compress_selection(&self, preds_2d: &Array2<f32>) -> (Vec<usize>, Vec<bool>) {
+        self.select_compress_frames(preds_2d)
+    }
+
+    /// Calculate quality scores.
+    ///
+    /// Mirrors NeMo `_get_log_pred_scores`: both clamps apply to the RAW
+    /// tensors — `log(clamp(p, min))` and `log(clamp(1 - p, min))`. An earlier
+    /// version clamped `p` first and derived `1 - p` from the clamped value,
+    /// which for any p < 0.25 substituted log(0.75) where the reference has
+    /// log(1 - p) — up to 0.24 of score error per speaker entering every
+    /// frame through the summed term, and the main reason cache compression
+    /// picked different survivors than NeMo (streaming parity audit,
+    /// 2026-08-28).
     fn get_log_pred_scores(&self, preds: &Array2<f32>) -> Array2<f32> {
         let mut scores = Array2::zeros(preds.dim());
 
         for t in 0..preds.shape()[0] {
             let mut log_1_probs_sum = 0.0f32;
             for s in 0..NUM_SPEAKERS {
-                let p = preds[[t, s]].max(PRED_SCORE_THRESHOLD);
-                let log_1_p = (1.0 - p).max(PRED_SCORE_THRESHOLD).ln();
+                let log_1_p = (1.0 - preds[[t, s]]).max(PRED_SCORE_THRESHOLD).ln();
                 log_1_probs_sum += log_1_p;
             }
 
             for s in 0..NUM_SPEAKERS {
-                let p = preds[[t, s]].max(PRED_SCORE_THRESHOLD);
-                let log_p = p.ln();
-                let log_1_p = (1.0 - p).max(PRED_SCORE_THRESHOLD).ln();
+                let log_p = preds[[t, s]].max(PRED_SCORE_THRESHOLD).ln();
+                let log_1_p = (1.0 - preds[[t, s]]).max(PRED_SCORE_THRESHOLD).ln();
                 scores[[t, s]] = log_p - log_1_p + log_1_probs_sum - 0.5f32.ln();
             }
         }
@@ -1184,14 +1229,29 @@ impl Sortformer {
         scores
     }
 
-    /// Disable non-speech and overlapped speech
+    /// Disable non-speech and overlapped speech.
+    ///
+    /// Mirrors NeMo `_disable_low_scores`: non-speech frames are masked to
+    /// -inf FIRST, and the positive count is taken from the masked scores —
+    /// a positive-scored frame whose pred is below the speech gate must not
+    /// count toward `min_pos_scores_per_spk` (an earlier version counted
+    /// positives before masking).
     fn disable_low_scores(
         &self,
         preds: &Array2<f32>,
         mut scores: Array2<f32>,
         min_pos_scores_per_spk: usize,
     ) -> Array2<f32> {
-        // Count positive scores per speaker
+        // Mask non-speech to -inf
+        for t in 0..preds.shape()[0] {
+            for s in 0..NUM_SPEAKERS {
+                if preds[[t, s]] <= 0.5 {
+                    scores[[t, s]] = f32::NEG_INFINITY;
+                }
+            }
+        }
+
+        // Count positive scores per speaker on the MASKED scores
         let mut pos_count = [0usize; NUM_SPEAKERS];
         for t in 0..scores.shape()[0] {
             for s in 0..NUM_SPEAKERS {
@@ -1201,17 +1261,15 @@ impl Sortformer {
             }
         }
 
+        // Disable non-positive speech frames once a speaker has enough positives
         for t in 0..preds.shape()[0] {
             for s in 0..NUM_SPEAKERS {
                 let is_speech = preds[[t, s]] > 0.5;
-
-                if !is_speech {
+                if is_speech
+                    && scores[[t, s] ] <= 0.0
+                    && pos_count[s] >= min_pos_scores_per_spk
+                {
                     scores[[t, s]] = f32::NEG_INFINITY;
-                } else {
-                    let is_pos = scores[[t, s]] > 0.0;
-                    if !is_pos && pos_count[s] >= min_pos_scores_per_spk {
-                        scores[[t, s]] = f32::NEG_INFINITY;
-                    }
                 }
             }
         }
