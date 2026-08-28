@@ -260,6 +260,18 @@ pub struct MultitalkerConfig {
     /// behavior). A 30s caller in Normal mode does ~26 sub-chunks, so
     /// budget `pause × 25` of added wall time per call.
     pub inter_chunk_pause: Option<std::time::Duration>,
+
+    /// When true, ASR sub-chunks not fully covered by COMPLETED diarizer
+    /// strides are held for a later call instead of decoding against the
+    /// provisional peek (whose zero-padded partial-stride predictions
+    /// differ from the authoritative pass that replaces them). Every word
+    /// is then decoded with settled speaker conditioning, at the cost of
+    /// up to one stride (~10s) of extra latency for chunk-tail words.
+    /// ⚠ With this on, a stream must be finished by feeding
+    /// [`MultitalkerASR::settle_flush_subchunks`] sub-chunks of silence,
+    /// or the held tail is never decoded. Default false (unchanged
+    /// peek-and-decode behavior).
+    pub hold_at_settled_frontier: bool,
 }
 
 impl Default for MultitalkerConfig {
@@ -270,6 +282,7 @@ impl Default for MultitalkerConfig {
             latency_mode: LatencyMode::default(),
             blank_penalty: 0.0,
             inter_chunk_pause: None,
+            hold_at_settled_frontier: false,
         }
     }
 }
@@ -458,6 +471,37 @@ impl MultitalkerASR {
     /// flat-out processing.
     pub fn set_inter_chunk_pause(&mut self, pause: Option<std::time::Duration>) {
         self.config.inter_chunk_pause = pause;
+    }
+
+    /// Hold ASR decoding at the settled diarizer frontier — see
+    /// [`MultitalkerConfig::hold_at_settled_frontier`]. Set before the
+    /// first `transcribe_chunk()` call; flipping it mid-stream is safe
+    /// (held sub-chunks simply decode on the next call) but pointless.
+    pub fn set_hold_at_settled_frontier(&mut self, hold: bool) {
+        self.config.hold_at_settled_frontier = hold;
+    }
+
+    /// Upper bound, in seconds, on audio waiting behind the settled
+    /// frontier when the hold is on: one not-yet-completed diarizer
+    /// stride plus one partial ASR sub-chunk. 0.0 when the hold is off.
+    pub fn max_holdback_secs(&self) -> f64 {
+        if !self.config.hold_at_settled_frontier {
+            return 0.0;
+        }
+        (self.sortformer.chunk_len + self.config.latency_mode.encoded_frames()) as f64
+            * f64::from(SECONDS_PER_ENCODED_FRAME)
+    }
+
+    /// Silence sub-chunks a caller must feed at end of stream so the
+    /// diarizer's current stride completes from any phase and every held
+    /// sub-chunk decodes settled. 0 when the hold is off.
+    pub fn settle_flush_subchunks(&self) -> usize {
+        if !self.config.hold_at_settled_frontier {
+            return 0;
+        }
+        self.sortformer
+            .chunk_len
+            .div_ceil(self.config.latency_mode.encoded_frames())
     }
 
     /// Set the streaming latency mode.
@@ -689,21 +733,37 @@ impl MultitalkerASR {
                 break;
             }
 
-            // Optional duty-cycling between sub-chunk inferences (never
-            // before the first, never after the last — the availability
-            // check above has already committed us to processing one).
-            // See `MultitalkerConfig::inter_chunk_pause`.
-            if !first_subchunk && let Some(pause) = self.config.inter_chunk_pause {
-                std::thread::sleep(pause);
-            }
-            first_subchunk = false;
-
             // Absolute diarization frame range for this sub-chunk. Both
             // sides use 80ms frames (SUBSAMPLING mel frames), so the
             // mapping is exact for every latency mode.
             let f_start = self.chunk_idx * enc_frames;
             let f_end = f_start + enc_frames;
             let covered = self.diar_pred_offset + self.diar_preds.len();
+
+            // Settled-frontier hold: a sub-chunk not fully covered by
+            // COMPLETED diarizer strides waits for the next call instead
+            // of decoding against the provisional peek. The provisional
+            // predictions come from a zero-padded partial stride and
+            // genuinely differ from the authoritative pass that follows —
+            // but by then the words' channel routing and the emitted
+            // activity were already final. Holding trades up to one
+            // stride of latency (~10s) for every word being decoded with
+            // settled speaker conditioning. The held audio stays in the
+            // buffer (the trim never removes past `audio_processed`), as
+            // do its settled-but-undecoded diar frames.
+            if self.config.hold_at_settled_frontier && f_end > covered {
+                break;
+            }
+
+            // Optional duty-cycling between sub-chunk inferences (never
+            // before the first, never after the last — placed after both
+            // break conditions so we never sleep for a sub-chunk we don't
+            // process). See `MultitalkerConfig::inter_chunk_pause`.
+            if !first_subchunk && let Some(pause) = self.config.inter_chunk_pause {
+                std::thread::sleep(pause);
+            }
+            first_subchunk = false;
+
             if f_end > covered && provisional.is_none() {
                 let t = std::time::Instant::now();
                 provisional = Some(self.sortformer.peek_buffered_raw()?.predictions);
