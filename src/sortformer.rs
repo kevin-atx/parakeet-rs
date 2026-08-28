@@ -1109,9 +1109,8 @@ impl Sortformer {
         let old_n = self.n_sil_frames as f32;
         self.n_sil_frames += batch_count;
         let new_n = self.n_sil_frames as f32;
-        for i in 0..EMB_DIM {
-            self.mean_sil_emb[[0, i]] =
-                (self.mean_sil_emb[[0, i]] * old_n + batch_sum[i]) / new_n;
+        for (i, &b) in batch_sum.iter().enumerate() {
+            self.mean_sil_emb[[0, i]] = (self.mean_sil_emb[[0, i]] * old_n + b) / new_n;
         }
     }
 
