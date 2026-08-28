@@ -61,7 +61,13 @@ pub fn apply_preemphasis(audio: &[f32], coef: f32) -> Vec<f32> {
     result
 }
 
-fn hann_window(window_length: usize) -> Vec<f32> {
+/// Symmetric Hann window (divide by N-1), matching NeMo's preprocessor:
+/// `FilterbankFeatures` builds its window with `torch.hann_window(win_length,
+/// periodic=False)`. Librosa would use the periodic form (divide by N) — NeMo
+/// models are trained on the symmetric one, so that is what every frontend in
+/// this crate must use. Shared by the ASR mel path and the Sortformer mel path;
+/// verified against the checkpoint's stored window tensor (max diff 2.5e-7).
+pub(crate) fn hann_window(window_length: usize) -> Vec<f32> {
     (0..window_length)
         .map(|i| 0.5 - 0.5 * ((2.0 * PI * i as f32) / (window_length as f32 - 1.0)).cos())
         .collect()

@@ -24,7 +24,6 @@ use crate::execution::ModelConfig;
 use ndarray::{s, Array1, Array2, Array3, ArrayView1, ArrayView2, Axis};
 use ort::session::Session;
 use realfft::RealFftPlanner;
-use std::f32::consts::PI;
 use std::path::Path;
 
 // Model constants
@@ -1490,20 +1489,17 @@ impl Sortformer {
         segments
     }
 
-    fn hann_window(window_length: usize) -> Vec<f32> {
-        // Librosa uses periodic window (fftbins=True): divide by N, not N-1
-        (0..window_length)
-            .map(|i| 0.5 - 0.5 * ((2.0 * PI * i as f32) / window_length as f32).cos())
-            .collect()
-    }
-
     fn stft(audio: &[f32]) -> Result<Array2<f32>> {
         let mut planner = RealFftPlanner::<f32>::new();
         let r2c = planner.plan_fft_forward(N_FFT);
 
-        // Create Hann window of length win_length, then zero-pad to n_fft (centered)
-        // This is exactly what librosa does: util.pad_center(fft_window, size=n_fft)
-        let hann = Self::hann_window(WIN_LENGTH);
+        // Symmetric Hann (crate::audio::hann_window — the one NeMo trains with),
+        // zero-padded to n_fft centered. This file used to build its own PERIODIC
+        // Hann here on the belief that librosa's convention applied; NeMo passes
+        // periodic=False, and the checkpoint's stored window tensor confirms it.
+        // The mismatch put ~0.4% systematic power error on every frame the
+        // diarizer ever saw (mel parity audit, 2026-08-28).
+        let hann = crate::audio::hann_window(WIN_LENGTH);
         let win_offset = (N_FFT - WIN_LENGTH) / 2;
         let mut fft_window = vec![0.0f32; N_FFT];
         fft_window[win_offset..(WIN_LENGTH + win_offset)].copy_from_slice(&hann[..WIN_LENGTH]);
@@ -1548,6 +1544,14 @@ impl Sortformer {
     }
 
     fn extract_mel_features(&self, audio: &[f32]) -> Result<Array3<f32>> {
+        Self::mel_features_with_basis(&self.mel_basis, audio)
+    }
+
+    /// The Sortformer mel front end. One implementation shared by the inference
+    /// path ([`extract_mel_features`](Self::extract_mel_features), via the cached
+    /// basis) and the parity instrument
+    /// ([`mel_features_standalone`](Self::mel_features_standalone)).
+    fn mel_features_with_basis(mel_basis: &Array2<f32>, audio: &[f32]) -> Result<Array3<f32>> {
         // 1. Add dither (small random noise to prevent log(0))
         // NeMo uses dither=1e-5, but for determinism we skip random noise
         // The log_zero_guard handles zero values
@@ -1559,7 +1563,7 @@ impl Sortformer {
         let spectrogram = Self::stft(&preemphasized)?;
 
         // 4. Apply mel filterbank (with Slaney normalization)
-        let mel_spec = self.mel_basis.dot(&spectrogram);
+        let mel_spec = mel_basis.dot(&spectrogram);
 
         // 5. Log with guard value (NeMo uses log_zero_guard_value = 2^-24)
         // NeMo uses normalize='NA' which means NO normalization
@@ -1568,11 +1572,28 @@ impl Sortformer {
         // Transpose to (batch, time, features) - NeMo outputs (B, D, T), model expects (B, T, D)
         Ok(log_mel_spec.t().to_owned().insert_axis(Axis(0)))
     }
+
+    /// Compute the exact production mel features without an ONNX session.
+    /// Exists for reference-parity instrumentation (comparing this front end
+    /// against NeMo's preprocessor on identical audio); inference goes through
+    /// [`extract_mel_features`](Self::extract_mel_features).
+    pub fn mel_features_standalone(audio: &[f32]) -> Result<Array3<f32>> {
+        let mel_basis = crate::audio::create_mel_filterbank(N_FFT, N_MELS, SAMPLE_RATE);
+        Self::mel_features_with_basis(&mel_basis, audio)
+    }
+
+    /// The mel filterbank the production front end uses, as built (n_mels x
+    /// freq_bins). Parity instrumentation only — lets the audit compare filter
+    /// weights against the reference implementation stage-by-stage.
+    pub fn mel_filterbank_standalone() -> Array2<f32> {
+        crate::audio::create_mel_filterbank(N_FFT, N_MELS, SAMPLE_RATE)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f32::consts::PI;
 
     fn sine_wave(freq_hz: f32, sample_rate: usize, num_samples: usize) -> Vec<f32> {
         (0..num_samples)
