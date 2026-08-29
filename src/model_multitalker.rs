@@ -68,21 +68,39 @@ impl MultitalkerModel {
         // Where-masking rewritten to arithmetic, no-op Slice removed) compiles
         // to ~4 CoreML partitions and beats int8-CPU while freeing the CPU.
         let encoder_path = {
-            let fp16 = model_dir.join("encoder.fp16.onnx");
-            let int8 = model_dir.join("encoder.int8.onnx");
-            let fp32 = model_dir.join("encoder.onnx");
-            let order = if is_coreml {
-                [&fp16, &int8, &fp32]
-            } else {
-                [&int8, &fp32, &fp16]
-            };
-            match order.iter().find(|p| p.exists()) {
-                Some(p) => (*p).clone(),
-                None => {
+            // Eval-only seam: an explicit encoder file overrides the EP-aware
+            // preference below. Exists to measure the int8 quantization tax —
+            // the CPU eval harness otherwise always runs int8 while production
+            // CoreML runs fp16, so benchmark absolutes carry a tax the product
+            // doesn't (recogment parity audit, phase d2). Absolute path
+            // allowed; a missing override is an ERROR, not a fallback — a
+            // measurement that silently reverted to int8 would report the tax
+            // as zero.
+            if let Ok(forced) = std::env::var("PARAKEET_ENCODER_FILE") {
+                let p = std::path::PathBuf::from(&forced);
+                if !p.exists() {
                     return Err(Error::Config(format!(
-                        "Missing encoder.fp16.onnx, encoder.int8.onnx or encoder.onnx in {}",
-                        model_dir.display()
-                    )))
+                        "PARAKEET_ENCODER_FILE={forced} does not exist"
+                    )));
+                }
+                p
+            } else {
+                let fp16 = model_dir.join("encoder.fp16.onnx");
+                let int8 = model_dir.join("encoder.int8.onnx");
+                let fp32 = model_dir.join("encoder.onnx");
+                let order = if is_coreml {
+                    [&fp16, &int8, &fp32]
+                } else {
+                    [&int8, &fp32, &fp16]
+                };
+                match order.iter().find(|p| p.exists()) {
+                    Some(p) => (*p).clone(),
+                    None => {
+                        return Err(Error::Config(format!(
+                            "Missing encoder.fp16.onnx, encoder.int8.onnx or encoder.onnx in {}",
+                            model_dir.display()
+                        )))
+                    }
                 }
             }
         };
