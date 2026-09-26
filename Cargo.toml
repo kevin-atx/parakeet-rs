@@ -75,3 +75,10 @@ preload-dylibs = ["ort/preload-dylibs"]
 [[example]]
 name = "coreml_smoke"
 path = "examples/coreml_smoke.rs"
+
+# Debug builds without debugging symbols for DEPENDENCIES; this project's own
+# code keeps full symbols and line numbers, so its stack traces are
+# unchanged. Full symbols for every dependency is what makes target/debug grow
+# to tens of GB. Release builds are unaffected.
+[profile.dev.package."*"]
+debug = false
