@@ -80,5 +80,9 @@ path = "examples/coreml_smoke.rs"
 # code keeps full symbols and line numbers, so its stack traces are
 # unchanged. Full symbols for every dependency is what makes target/debug grow
 # to tens of GB. Release builds are unaffected.
+# `strip = false` is required beside it: with debug off Cargo strips each
+# dependency by default, and macOS 27 dyld refuses a stripped proc-macro
+# dylib ("mis-aligned LINKEDIT string pool"). Nothing to strip anyway.
 [profile.dev.package."*"]
 debug = false
+strip = false
