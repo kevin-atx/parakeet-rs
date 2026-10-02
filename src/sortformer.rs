@@ -434,9 +434,14 @@ impl Sortformer {
         execution_config: Option<ModelConfig>,
         config: DiarizationConfig,
     ) -> Result<Self> {
-        let config_to_use = execution_config.unwrap_or_default();
-        let session = config_to_use.build_session(model_path.as_ref())?;
+        let session = execution_config.unwrap_or_default().build_session(model_path.as_ref())?;
+        Self::from_session(session, config)
+    }
 
+    /// Build from an already-loaded session — so a caller that opened the
+    /// file to read its metadata (see `Diarizer::load`) does not load the
+    /// weights twice.
+    pub(crate) fn from_session(session: Session, config: DiarizationConfig) -> Result<Self> {
         // Read streaming constants from ONNX metadata (fallback to defaults)
         let (chunk_len, fifo_len, spkcache_len, right_context) =
             if let Ok(metadata) = session.metadata() {

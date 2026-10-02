@@ -16,7 +16,8 @@ use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_multitalker::{MultitalkerEncoderCache, MultitalkerModel};
 use crate::nemotron::SentencePieceVocab;
-use crate::sortformer::{Sortformer, NUM_SPEAKERS};
+use crate::diarizer::Diarizer;
+use crate::sortformer::NUM_SPEAKERS;
 use crate::timestamps::{self, TimestampMode};
 use crate::transcriber::Transcriber;
 use ndarray::{s, Array1, Array2, Array3};
@@ -272,6 +273,14 @@ pub struct MultitalkerConfig {
     /// or the held tail is never decoded. Default false (unchanged
     /// peek-and-decode behavior).
     pub hold_at_settled_frontier: bool,
+
+    /// Condition the speaker encoders on BINARISED diarization (p > 0.5 → 1,
+    /// else 0), NVIDIA's reference setting for this model pair
+    /// (`binary_diar_preds=true` in NeMo's multitalker streaming script).
+    /// Applies to the copy that picks which speakers get a decoder pass and
+    /// derives their targets; the emitted `speaker_activity` stays soft.
+    /// Default false (soft conditioning, unchanged behaviour).
+    pub binary_diar_preds: bool,
 }
 
 impl Default for MultitalkerConfig {
@@ -283,6 +292,7 @@ impl Default for MultitalkerConfig {
             blank_penalty: 0.0,
             inter_chunk_pause: None,
             hold_at_settled_frontier: false,
+            binary_diar_preds: false,
         }
     }
 }
@@ -298,7 +308,9 @@ impl MultitalkerConfig {
 /// speaker-kernel-injected ASR encoding.
 pub struct MultitalkerASR {
     model: MultitalkerModel,
-    sortformer: Sortformer,
+    /// Streaming Sortformer v2 or Nemotron 3 Diarization — whichever the
+    /// diarizer model file holds (`Diarizer::load`).
+    diarizer: Diarizer,
     vocab: SentencePieceVocab,
     speakers: Vec<SpeakerInstance>,
     config: MultitalkerConfig,
@@ -311,13 +323,13 @@ pub struct MultitalkerASR {
     /// are trimmed after each call; ASR sub-chunks ahead of the last
     /// completed stride use a provisional peek instead (see
     /// `transcribe_chunk_inner`).
-    diar_preds: Vec<[f32; NUM_SPEAKERS]>,
+    diar_preds: Vec<Vec<f32>>,
     /// Absolute 80ms-frame index of `diar_preds[0]`.
     diar_pred_offset: usize,
 }
 
 /// Assemble the diarization mask window for one ASR sub-chunk covering
-/// absolute 80ms frames `[f_start, f_end)`.
+/// absolute 80ms frames `[f_start, f_end)`, `width` speakers wide.
 ///
 /// `authoritative` row i holds absolute frame `auth_offset + i` (completed
 /// Sortformer strides); `provisional` row j holds absolute frame
@@ -325,7 +337,8 @@ pub struct MultitalkerASR {
 /// not-yet-strided tail). Frames covered by neither source are zero
 /// (treated as silence).
 fn assemble_diar_window(
-    authoritative: &[[f32; NUM_SPEAKERS]],
+    authoritative: &[Vec<f32>],
+    width: usize,
     auth_offset: usize,
     provisional: Option<&Array2<f32>>,
     f_start: usize,
@@ -333,18 +346,18 @@ fn assemble_diar_window(
 ) -> Array2<f32> {
     let n = f_end.saturating_sub(f_start);
     let covered = auth_offset + authoritative.len();
-    let mut window = Array2::zeros((n, NUM_SPEAKERS));
+    let mut window = Array2::zeros((n, width));
 
     for i in 0..n {
         let f = f_start + i;
         if f >= auth_offset && f < covered {
             let row = &authoritative[f - auth_offset];
-            for s in 0..NUM_SPEAKERS {
+            for s in 0..width.min(row.len()) {
                 window[[i, s]] = row[s];
             }
         } else if let Some(p) = provisional.filter(|p| f >= covered && f - covered < p.nrows()) {
             let pi = f - covered;
-            for s in 0..NUM_SPEAKERS.min(p.ncols()) {
+            for s in 0..width.min(p.ncols()) {
                 window[[i, s]] = p[[pi, s]];
             }
         }
@@ -401,20 +414,20 @@ impl MultitalkerASR {
             cpu_arena: false,
             ..exec
         };
-        let sortformer = Sortformer::with_config(
-            sortformer_model_path,
-            Some(sortformer_exec),
-            crate::sortformer::DiarizationConfig::default(),
-        )?;
+        let diarizer = Diarizer::load(sortformer_model_path, Some(sortformer_exec))?;
+        let config = MultitalkerConfig {
+            max_speakers: diarizer.num_speakers(),
+            ..MultitalkerConfig::default()
+        };
 
         let mel_basis = crate::audio::create_mel_filterbank(N_FFT, N_MELS, SAMPLE_RATE);
 
         Ok(Self {
             model,
-            sortformer,
+            diarizer,
             vocab,
             speakers: Vec::new(),
-            config: MultitalkerConfig::default(),
+            config,
             mel_basis,
             audio_buffer: Vec::new(),
             audio_processed: 0,
@@ -427,7 +440,7 @@ impl MultitalkerASR {
     /// Reset all state for a new utterance.
     pub fn reset(&mut self) {
         self.speakers.clear();
-        self.sortformer.reset_state();
+        self.diarizer.reset_state();
         self.audio_buffer.clear();
         self.audio_processed = 0;
         self.chunk_idx = 0;
@@ -440,13 +453,13 @@ impl MultitalkerASR {
         &self.config
     }
 
-    /// Set the maximum number of speakers to track (1..=4).
+    /// Set the maximum number of speakers to track (1..=the diarizer's slots).
     ///
     /// Can be called between chunks to adjust mid-session. Existing speaker
     /// instances above the new limit will still produce output for any
     /// already-accumulated tokens, but won't receive new audio.
     pub fn set_max_speakers(&mut self, max_speakers: usize) {
-        self.config.max_speakers = max_speakers.clamp(1, NUM_SPEAKERS);
+        self.config.max_speakers = max_speakers.clamp(1, self.diarizer.num_speakers());
     }
 
     /// Set the speaker activity threshold (0.0..=1.0).
@@ -481,6 +494,12 @@ impl MultitalkerASR {
         self.config.hold_at_settled_frontier = hold;
     }
 
+    /// Binarised speaker conditioning — see
+    /// [`MultitalkerConfig::binary_diar_preds`]. Takes effect on the next call.
+    pub fn set_binary_diar_preds(&mut self, on: bool) {
+        self.config.binary_diar_preds = on;
+    }
+
     /// Upper bound, in seconds, on audio waiting behind the settled
     /// frontier when the hold is on: one not-yet-completed diarizer
     /// stride plus one partial ASR sub-chunk. 0.0 when the hold is off.
@@ -488,7 +507,7 @@ impl MultitalkerASR {
         if !self.config.hold_at_settled_frontier {
             return 0.0;
         }
-        (self.sortformer.chunk_len + self.config.latency_mode.encoded_frames()) as f64
+        (self.diarizer.chunk_len() + self.config.latency_mode.encoded_frames()) as f64
             * f64::from(SECONDS_PER_ENCODED_FRAME)
     }
 
@@ -499,8 +518,8 @@ impl MultitalkerASR {
         if !self.config.hold_at_settled_frontier {
             return 0;
         }
-        self.sortformer
-            .chunk_len
+        self.diarizer
+            .chunk_len()
             .div_ceil(self.config.latency_mode.encoded_frames())
     }
 
@@ -522,7 +541,7 @@ impl MultitalkerASR {
     /// [`Sortformer::set_emit_frame_embeddings`](crate::sortformer::Sortformer::set_emit_frame_embeddings)
     /// for what they are and what they cost.
     pub fn set_emit_frame_embeddings(&mut self, on: bool) {
-        self.sortformer.set_emit_frame_embeddings(on);
+        self.diarizer.set_emit_frame_embeddings(on);
     }
 
     /// What the diarizer currently believes each of its slots sounds like.
@@ -532,7 +551,19 @@ impl MultitalkerASR {
     /// describe (e.g. when a conversation ends) rather than treating it as a
     /// property of any one chunk.
     pub fn slot_profiles(&self) -> Vec<crate::sortformer::SlotProfile> {
-        self.sortformer.slot_profiles()
+        self.diarizer.slot_profiles()
+    }
+
+    /// Speaker slots the loaded diarizer has (4 for Sortformer v2, 8 for
+    /// Nemotron 3) — the width of every activity row this pipeline emits.
+    pub fn num_speakers(&self) -> usize {
+        self.diarizer.num_speakers()
+    }
+
+    /// Which diarizer is loaded (`"sortformer_v2"` / `"nemotron3"`), for
+    /// logs and provenance.
+    pub fn diarizer_kind(&self) -> &'static str {
+        self.diarizer.kind()
     }
 
     /// Returns the number of audio samples the caller should provide per
@@ -565,11 +596,11 @@ impl MultitalkerASR {
         // Uses the current streaming state (speaker cache, silence profile) so
         // slot assignments match the streaming path — slot 0 stays the same person.
         // Do NOT reset_state() here — that would lose the slot→person mapping.
-        let saved_state = self.sortformer.save_state();
+        let saved_state = self.diarizer.save_state();
 
-        let result = self.sortformer.diarize_chunk_raw(audio_16k_mono);
+        let result = self.diarizer.diarize_chunk_raw(audio_16k_mono);
 
-        self.sortformer.restore_state(saved_state);
+        self.diarizer.restore_state(saved_state);
 
         let raw_preds = result?;
         let num_frames = raw_preds.num_valid_frames.min(raw_preds.predictions.nrows());
@@ -663,7 +694,7 @@ impl MultitalkerASR {
         // taken BEFORE the append below, which is what makes the embeddings
         // block self-locating.
         let emb_first_frame = self.diar_pred_offset + self.diar_preds.len();
-        let new_raw = self.sortformer.feed_raw(audio_chunk)?;
+        let new_raw = self.diarizer.feed_raw(audio_chunk)?;
         let t_sortformer = t.elapsed();
         let frame_embeddings = new_raw.embeddings.as_ref().map(|e| FrameEmbeddings {
             first_frame: emb_first_frame,
@@ -671,11 +702,7 @@ impl MultitalkerASR {
             data: e.iter().copied().collect(),
         });
         for row in new_raw.predictions.rows() {
-            let mut frame = [0.0f32; NUM_SPEAKERS];
-            for s in 0..NUM_SPEAKERS.min(row.len()) {
-                frame[s] = row[s];
-            }
-            self.diar_preds.push(frame);
+            self.diar_preds.push(row.to_vec());
         }
 
         let total_audio = self.audio_buffer.len();
@@ -766,25 +793,36 @@ impl MultitalkerASR {
 
             if f_end > covered && provisional.is_none() {
                 let t = std::time::Instant::now();
-                provisional = Some(self.sortformer.peek_buffered_raw()?.predictions);
+                provisional = Some(self.diarizer.peek_buffered_raw()?.predictions);
                 t_peek += t.elapsed();
             }
             let window = assemble_diar_window(
                 &self.diar_preds,
+                self.diarizer.num_speakers(),
                 self.diar_pred_offset,
                 provisional.as_ref(),
                 f_start,
                 f_end,
             );
 
+            // What routes the encoders: the window itself, or its binarised
+            // copy (`binary_diar_preds`). The soft window is what's emitted.
+            let binarised;
+            let routing = if self.config.binary_diar_preds {
+                binarised = window.mapv(|v| if v > 0.5 { 1.0 } else { 0.0 });
+                &binarised
+            } else {
+                &window
+            };
+
             // Determine active speakers in this sub-chunk
             let mut active_speakers = Vec::new();
             for spk_id in 0..self.config.max_speakers {
-                if spk_id >= window.ncols() {
+                if spk_id >= routing.ncols() {
                     break;
                 }
-                let max_activity = (0..window.nrows())
-                    .map(|t| window[[t, spk_id]])
+                let max_activity = (0..routing.nrows())
+                    .map(|t| routing[[t, spk_id]])
                     .fold(0.0f32, f32::max);
                 if max_activity > self.config.activity_threshold {
                     active_speakers.push(spk_id);
@@ -810,7 +848,7 @@ impl MultitalkerASR {
             for &spk_id in &active_speakers {
                 // Derive spk_targets and bg_spk_targets from the mask window
                 let (spk_targets, bg_spk_targets) =
-                    self.derive_speaker_targets(&window, spk_id, chunk_length)?;
+                    self.derive_speaker_targets(routing, spk_id, chunk_length)?;
 
                 let spk_idx = self
                     .speakers
@@ -1194,8 +1232,8 @@ fn apply_blank_penalty(logits: &mut Array1<f32>, penalty: f32) {
 mod tests {
     use super::*;
 
-    fn auth_rows(vals: &[f32]) -> Vec<[f32; NUM_SPEAKERS]> {
-        vals.iter().map(|&v| [v; NUM_SPEAKERS]).collect()
+    fn auth_rows(vals: &[f32]) -> Vec<Vec<f32>> {
+        vals.iter().map(|&v| vec![v; NUM_SPEAKERS]).collect()
     }
 
     // Joint output: VOCAB_SIZE tokenizer tokens (ids 0..=1023) + blank
@@ -1244,7 +1282,7 @@ mod tests {
     #[test]
     fn window_fully_authoritative() {
         let auth = auth_rows(&[0.1, 0.2, 0.3, 0.4]);
-        let w = assemble_diar_window(&auth, 10, None, 11, 13);
+        let w = assemble_diar_window(&auth, NUM_SPEAKERS, 10, None, 11, 13);
         assert_eq!(w.nrows(), 2);
         assert_eq!(w[[0, 0]], 0.2);
         assert_eq!(w[[1, 3]], 0.3);
@@ -1254,7 +1292,7 @@ mod tests {
     fn window_spans_authoritative_and_provisional() {
         let auth = auth_rows(&[0.1, 0.2]); // frames 0..2
         let p = prov(&[0.7, 0.8]); // frames 2..4
-        let w = assemble_diar_window(&auth, 0, Some(&p), 1, 4);
+        let w = assemble_diar_window(&auth, NUM_SPEAKERS, 0, Some(&p), 1, 4);
         assert_eq!(w.nrows(), 3);
         assert_eq!(w[[0, 0]], 0.2); // frame 1: authoritative
         assert_eq!(w[[1, 0]], 0.7); // frame 2: provisional
@@ -1266,22 +1304,35 @@ mod tests {
         // No provisional and range beyond authoritative coverage → zeros
         // (treated as silence, never a panic).
         let auth = auth_rows(&[0.5]);
-        let w = assemble_diar_window(&auth, 0, None, 0, 3);
+        let w = assemble_diar_window(&auth, NUM_SPEAKERS, 0, None, 0, 3);
         assert_eq!(w[[0, 0]], 0.5);
         assert_eq!(w[[1, 0]], 0.0);
         assert_eq!(w[[2, 0]], 0.0);
 
         // Provisional shorter than needed → trailing zeros.
         let p = prov(&[0.9]);
-        let w = assemble_diar_window(&auth, 0, Some(&p), 0, 3);
+        let w = assemble_diar_window(&auth, NUM_SPEAKERS, 0, Some(&p), 0, 3);
         assert_eq!(w[[1, 0]], 0.9);
         assert_eq!(w[[2, 0]], 0.0);
     }
 
     #[test]
+    fn window_is_as_wide_as_the_diarizer() {
+        // An 8-speaker diarizer: every column carried through, from both
+        // sources, and a narrower provisional block leaves the rest silent.
+        let auth: Vec<Vec<f32>> = vec![(0..8).map(|s| s as f32 / 10.0).collect()];
+        let p = Array2::from_shape_fn((1, 4), |(_, s)| 0.5 + s as f32 / 10.0);
+        let w = assemble_diar_window(&auth, 8, 0, Some(&p), 0, 2);
+        assert_eq!(w.dim(), (2, 8));
+        assert_eq!(w[[0, 7]], 0.7);
+        assert_eq!(w[[1, 3]], 0.8);
+        assert_eq!(w[[1, 4]], 0.0);
+    }
+
+    #[test]
     fn window_empty_range() {
         let auth = auth_rows(&[0.5]);
-        let w = assemble_diar_window(&auth, 0, None, 3, 3);
+        let w = assemble_diar_window(&auth, NUM_SPEAKERS, 0, None, 3, 3);
         assert_eq!(w.nrows(), 0);
     }
 
