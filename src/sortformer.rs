@@ -240,15 +240,26 @@ fn cosine(a: ArrayView1<f32>, b: ArrayView1<f32>) -> f32 {
 /// `cache_rows` clamps the scan: the two arrays are grown and compressed
 /// together so they should agree, but a mismatch would index one past the end
 /// of the other.
+#[cfg(test)]
 fn slot_member_rows_from(
     preds: ArrayView2<f32>,
     cache_rows: usize,
     speaker_id: usize,
 ) -> Vec<usize> {
-    if speaker_id >= NUM_SPEAKERS {
+    slot_member_rows_n(preds, cache_rows, speaker_id, NUM_SPEAKERS)
+}
+
+/// [`slot_member_rows_from`] for a diarizer with `num_speakers` slots.
+fn slot_member_rows_n(
+    preds: ArrayView2<f32>,
+    cache_rows: usize,
+    speaker_id: usize,
+    num_speakers: usize,
+) -> Vec<usize> {
+    if speaker_id >= num_speakers {
         return Vec::new();
     }
-    let slots = preds.ncols().min(NUM_SPEAKERS);
+    let slots = preds.ncols().min(num_speakers);
     if speaker_id >= slots {
         return Vec::new();
     }
@@ -266,8 +277,17 @@ fn slot_members_from(
     preds: ArrayView2<f32>,
     speaker_id: usize,
 ) -> Array2<f32> {
+    slot_members_n(cache, preds, speaker_id, NUM_SPEAKERS)
+}
+
+fn slot_members_n(
+    cache: ArrayView2<f32>,
+    preds: ArrayView2<f32>,
+    speaker_id: usize,
+    num_speakers: usize,
+) -> Array2<f32> {
     let dim = cache.ncols();
-    let rows = slot_member_rows_from(preds, cache.nrows(), speaker_id);
+    let rows = slot_member_rows_n(preds, cache.nrows(), speaker_id, num_speakers);
     let mut out = Array2::zeros((rows.len(), dim));
     for (i, &t) in rows.iter().enumerate() {
         out.slice_mut(s![i, ..]).assign(&cache.slice(s![t, ..]));
@@ -278,7 +298,7 @@ fn slot_members_from(
 /// A slot the model has not used: reported rather than omitted, so callers can
 /// index `slot_profiles()` by slot id. `dim` keeps the placeholder centroid the
 /// same width as the real ones.
-fn empty_profile(speaker_id: usize, dim: usize) -> SlotProfile {
+pub(crate) fn empty_profile(speaker_id: usize, dim: usize) -> SlotProfile {
     SlotProfile {
         speaker_id,
         frames: 0,
@@ -293,9 +313,19 @@ fn empty_profile(speaker_id: usize, dim: usize) -> SlotProfile {
 /// Free function, not a method, so the selection and centroid maths are
 /// testable without an ONNX session.
 fn slot_profiles_from(cache: ArrayView2<f32>, preds: ArrayView2<f32>) -> Vec<SlotProfile> {
-    (0..NUM_SPEAKERS)
+    slot_profiles_n(cache, preds, NUM_SPEAKERS)
+}
+
+/// [`slot_profiles_from`] for a diarizer with `num_speakers` slots — one
+/// profile per slot, unused slots included.
+pub(crate) fn slot_profiles_n(
+    cache: ArrayView2<f32>,
+    preds: ArrayView2<f32>,
+    num_speakers: usize,
+) -> Vec<SlotProfile> {
+    (0..num_speakers)
         .map(|speaker_id| {
-            let members = slot_members_from(cache, preds, speaker_id);
+            let members = slot_members_n(cache, preds, speaker_id, num_speakers);
             let frames = members.nrows();
             if frames == 0 {
                 return empty_profile(speaker_id, cache.ncols());
@@ -1608,7 +1638,7 @@ impl Sortformer {
     /// path ([`extract_mel_features`](Self::extract_mel_features), via the cached
     /// basis) and the parity instrument
     /// ([`mel_features_standalone`](Self::mel_features_standalone)).
-    fn mel_features_with_basis(mel_basis: &Array2<f32>, audio: &[f32]) -> Result<Array3<f32>> {
+    pub(crate) fn mel_features_with_basis(mel_basis: &Array2<f32>, audio: &[f32]) -> Result<Array3<f32>> {
         // 1. Add dither (small random noise to prevent log(0))
         // NeMo uses dither=1e-5, but for determinism we skip random noise
         // The log_zero_guard handles zero values

@@ -61,6 +61,8 @@ mod parakeet_tdt;
 mod parakeet_unified;
 #[cfg(feature = "sortformer")]
 pub mod sortformer;
+#[cfg(feature = "sortformer")]
+pub mod nemotron_diar;
 #[cfg(feature = "multitalker")]
 mod model_multitalker;
 #[cfg(feature = "multitalker")]
