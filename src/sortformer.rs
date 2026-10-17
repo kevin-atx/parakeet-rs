@@ -1661,8 +1661,14 @@ impl Sortformer {
         // NeMo uses normalize='NA' which means NO normalization
         let log_mel_spec = mel_spec.mapv(|x| (x + LOG_ZERO_GUARD).ln());
 
-        // Transpose to (batch, time, features) - NeMo outputs (B, D, T), model expects (B, T, D)
-        Ok(log_mel_spec.t().to_owned().insert_axis(Axis(0)))
+        // Transpose to (batch, time, features) - NeMo outputs (B, D, T), model expects (B, T, D).
+        // `as_standard_layout`, not `to_owned`: a copy of the transposed view KEEPS
+        // its column-major layout, and so does a slice of it that covers the whole
+        // buffer — which `TensorRef::from_array_view` refuses ("non-contiguous
+        // layout"). Nemotron's full-buffer pass hit exactly that whenever the buffer
+        // fit one step and its frame count was a multiple of the subsampling factor
+        // (no padding row to force a copy): about one buffer in eight under ~27 s.
+        Ok(log_mel_spec.t().as_standard_layout().into_owned().insert_axis(Axis(0)))
     }
 
     /// Compute the exact production mel features without an ONNX session.
@@ -1691,6 +1697,24 @@ mod tests {
         (0..num_samples)
             .map(|i| (2.0 * PI * freq_hz * i as f32 / sample_rate as f32).sin())
             .collect()
+    }
+
+    /// The features reach the models row-major for every buffer length,
+    /// including a frame count that is a multiple of the subsampling factor —
+    /// the length that used to come out column-major (see
+    /// `mel_features_with_basis`), whole-buffer slices included.
+    #[test]
+    fn mel_features_are_row_major_for_every_length() {
+        for frames in [8usize, 9, 336, 337] {
+            // Centre-padded STFT: `n / HOP_LENGTH + 1` frames.
+            let audio = sine_wave(440.0, SAMPLE_RATE, (frames - 1) * HOP_LENGTH);
+            let mel = Sortformer::mel_features_standalone(&audio).unwrap();
+            assert_eq!(mel.shape()[1], frames, "frame count for {frames}");
+            assert!(mel.is_standard_layout(), "{frames} frames: features are row-major");
+            let whole = mel.slice(s![0, .., ..]).to_owned();
+            let step = whole.slice(s![0..whole.nrows(), ..]).to_owned().insert_axis(Axis(0));
+            assert!(step.is_standard_layout(), "{frames} frames: a whole-buffer step is row-major");
+        }
     }
 
     #[test]
