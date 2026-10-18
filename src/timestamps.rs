@@ -89,6 +89,31 @@ pub fn rebuild_text(tokens: &[TimedToken], mode: TimestampMode) -> String {
     }
 }
 
+/// Whether a token begins a word: it carries a SentencePiece word-boundary
+/// marker (▁ or a leading space) or is punctuation standing alone — but never a
+/// contraction ("'s", "'re") or a hyphenation ("-two"), which attach to the
+/// word before them. THE rule; [`group_by_words`] and
+/// [`continues_previous_word`] both ask it.
+pub(crate) fn token_starts_word(text: &str) -> bool {
+    let is_pure_punctuation = !text.is_empty() && text.chars().all(|c| c.is_ascii_punctuation());
+    let without_marker = text.trim_start_matches('▁').trim_start_matches(' ');
+    let is_contraction = without_marker.starts_with('\'');
+    let is_hyphenation = without_marker.starts_with('-');
+    (text.starts_with('▁') || text.starts_with(' ') || is_pure_punctuation) && !is_contraction && !is_hyphenation
+}
+
+/// Whether the first word [`group_by_words`] makes of `tokens` is the rest of a
+/// word begun before them: their first token does not start a word. A stream
+/// decoded a call at a time needs this, because `group_by_words` has to start
+/// its first word somewhere and cannot see the call before — so a word whose
+/// pieces straddle two calls came out as two words ("attitud" | "e").
+pub(crate) fn continues_previous_word(tokens: &[TimedToken]) -> bool {
+    match tokens.first() {
+        Some(t) if !t.text.trim().is_empty() => !token_starts_word(&t.text),
+        _ => false,
+    }
+}
+
 // Group tokens into words based on word boundary markers
 pub(crate) fn group_by_words(tokens: &[TimedToken]) -> Vec<TimedToken> {
     let Some(last_token) = tokens.last() else {
@@ -122,23 +147,11 @@ pub(crate) fn group_by_words(tokens: &[TimedToken]) -> Vec<TimedToken> {
             continue;
         }
 
-        // Check if this starts a new word (SentencePiece uses ▁ or space prefix)
-        // Also treat PURE punctuation marks (like ".", ",") as separate words
-        // But NOT contractions like "'re" or "'s" or hyphenations like "-two" (ex. twenty-two) which should attach to previous word
-        let is_pure_punctuation =
-            !token.text.is_empty() && token.text.chars().all(|c| c.is_ascii_punctuation());
-
-        // Check if this is a contraction or hyphenation suffix
-        // These should NOT start a new word - they attach to the previous word
-        let token_without_marker = token.text.trim_start_matches('▁').trim_start_matches(' ');
-        let is_contraction = token_without_marker.starts_with('\'');
-        let is_hyphenation = token_without_marker.starts_with('-');
-
-        let starts_word =
-            (token.text.starts_with('▁') || token.text.starts_with(' ') || is_pure_punctuation)
-                && !is_contraction
-                && !is_hyphenation
-                || i == 0;
+        // A new word starts at a word-boundary marker or standalone
+        // punctuation, never at a contraction or hyphenation suffix
+        // (`token_starts_word`) — and at the first token, which has nothing
+        // before it here (`continues_previous_word` says when it should have).
+        let starts_word = token_starts_word(&token.text) || i == 0;
 
         if starts_word && !current_word_text.is_empty() {
             // Save previous word (with deduplication)
@@ -258,6 +271,33 @@ fn format_sentence(words: &[TimedToken]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tok(text: &str, start: f32) -> TimedToken {
+        TimedToken { text: text.to_string(), start, end: start + 0.08, confidence: 1.0 }
+    }
+
+    /// The pieces a call boundary separates, as the 2026-10-18 webinar decoded
+    /// them: each is the rest of the word before, and only a token that starts
+    /// a word (a marker, or standalone punctuation) begins one.
+    #[test]
+    fn a_call_that_begins_inside_a_word_says_so() {
+        for piece in ["e", "itudes", "'s", "-two"] {
+            assert!(continues_previous_word(&[tok(piece, 0.0), tok("▁so", 0.1)]), "{piece:?}");
+        }
+        for start in ["▁So", " So", ".", ","] {
+            assert!(!continues_previous_word(&[tok(start, 0.0)]), "{start:?}");
+        }
+        assert!(!continues_previous_word(&[]), "no tokens, nothing to continue");
+        assert!(!continues_previous_word(&[tok("▁", 0.0), tok("itudes", 0.1)]), "a separator first means a new word");
+    }
+
+    /// Lifting the rule into `token_starts_word` must not move a word boundary.
+    #[test]
+    fn the_shared_rule_groups_words_as_before() {
+        let words = group_by_words(&[tok("att", 0.0), tok("itudes", 0.1), tok("▁it", 0.2), tok("'s", 0.3), tok(".", 0.4), tok("▁twenty", 0.5), tok("-two", 0.6)]);
+        let texts: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(texts, ["attitudes", "it's", ".", "twenty-two"]);
+    }
 
     #[test]
     fn test_word_grouping() {

@@ -62,6 +62,12 @@ pub struct WordTimestamp {
     pub end_secs: f32,
     /// Confidence score (min softmax probability across subword tokens). 0.0–1.0.
     pub confidence: f32,
+    /// The rest of a word this speaker's PREVIOUS call ended in the middle
+    /// of. Each call's words are built from that call's tokens, so a word
+    /// whose pieces straddle two calls arrives as two ("attitud" then "e", "it"
+    /// then "'s"); only a call's first word can be one, and the caller joins it
+    /// onto the last word it received.
+    pub continues_previous: bool,
 }
 
 /// Per-speaker state for the multi-instance architecture.
@@ -1190,13 +1196,16 @@ impl MultitalkerASR {
             })
             .collect();
 
+        let continues = timestamps::continues_previous_word(&timed);
         timestamps::group_by_words(&timed)
             .into_iter()
-            .map(|t| WordTimestamp {
+            .enumerate()
+            .map(|(i, t)| WordTimestamp {
                 word: t.text,
                 start_secs: t.start,
                 end_secs: t.end,
                 confidence: t.confidence,
+                continues_previous: i == 0 && continues,
             })
             .collect()
     }
