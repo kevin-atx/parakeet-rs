@@ -374,6 +374,58 @@ fn assemble_diar_window(
     window
 }
 
+/// Speaker and background targets for one sub-chunk's encoder pass, from
+/// its diarizer frames (one per encoded frame).
+///
+/// For the target speaker k at diarizer frame t:
+/// - `spk_targets = preds[t, k]`
+/// - `bg_spk_targets = max(preds[t, j]) for j != k`
+///
+/// The encoder takes `encoder_time` entries (the pre-encode cache plus the
+/// sub-chunk's mel frames), but the exported graph reads only the LAST
+/// `T_x` of them, one per encoded frame (NeMo's `solve_length_mismatch`,
+/// `mask[:, -x.shape[1]:]`). So diarizer frame t goes at
+/// `encoder_time - diar_frames + t`, one to one, as NeMo passes them; the
+/// leading entries are never read and repeat frame 0. Until 2026-10-18 the
+/// frames were stretched over all `encoder_time` entries, so the 14 the graph
+/// reads held frames 12 and 13 only: each 1.12 s step was conditioned on its
+/// last 160 ms, and a speaker pausing at a sentence end read as silent for
+/// the whole step, which dropped its last words.
+fn derive_speaker_targets(
+    diar_preds: &Array2<f32>,
+    speaker_id: usize,
+    encoder_time: usize,
+) -> Result<(Array2<f32>, Array2<f32>)> {
+    let diar_frames = diar_preds.nrows();
+    let has_speaker = diar_frames > 0 && speaker_id < diar_preds.ncols();
+    // Entries before the diarizer frames (never read by the graph), and
+    // frames beyond what the entries hold (only the newest are read).
+    let lead = encoder_time.saturating_sub(diar_frames);
+    let skip = diar_frames.saturating_sub(encoder_time);
+
+    let (spk_vals, bg_vals): (Vec<f32>, Vec<f32>) = (0..encoder_time)
+        .map(|i| {
+            if !has_speaker {
+                // No diarisation data: assume single speaker
+                return (1.0, 0.0);
+            }
+            let t = skip + i.saturating_sub(lead);
+            let bg = (0..diar_preds.ncols())
+                .filter(|&j| j != speaker_id)
+                .map(|j| diar_preds[[t, j]])
+                .fold(0.0f32, f32::max);
+            (diar_preds[[t, speaker_id]], bg)
+        })
+        .unzip();
+
+    let spk_targets = Array2::from_shape_vec((1, encoder_time), spk_vals)
+        .map_err(|e| Error::Model(format!("spk_targets shape mismatch: {e}")))?;
+    let bg_spk_targets = Array2::from_shape_vec((1, encoder_time), bg_vals)
+        .map_err(|e| Error::Model(format!("bg_spk_targets shape mismatch: {e}")))?;
+
+    Ok((spk_targets, bg_spk_targets))
+}
+
 impl MultitalkerASR {
     /// Load the multitalker ASR pipeline.
     ///
@@ -854,7 +906,7 @@ impl MultitalkerASR {
             for &spk_id in &active_speakers {
                 // Derive spk_targets and bg_spk_targets from the mask window
                 let (spk_targets, bg_spk_targets) =
-                    self.derive_speaker_targets(routing, spk_id, chunk_length)?;
+                    derive_speaker_targets(routing, spk_id, chunk_length)?;
 
                 let spk_idx = self
                     .speakers
@@ -1022,55 +1074,6 @@ impl MultitalkerASR {
         }
 
         Ok(self.get_transcripts())
-    }
-
-    /// Derive per-speaker target masks from raw Sortformer predictions.
-    ///
-    /// For the target speaker k:
-    /// - `spk_targets[t] = raw_preds[t, k]`
-    /// - `bg_spk_targets[t] = max(raw_preds[t, j]) for j != k`
-    ///
-    /// The masks are resized/interpolated to match the encoder's time dimension.
-    fn derive_speaker_targets(
-        &self,
-        diar_preds: &Array2<f32>,
-        speaker_id: usize,
-        encoder_time: usize,
-    ) -> Result<(Array2<f32>, Array2<f32>)> {
-        let diar_frames = diar_preds.nrows();
-
-        let mut spk_vals = Vec::with_capacity(encoder_time);
-        let mut bg_vals = Vec::with_capacity(encoder_time);
-
-        for enc_t in 0..encoder_time {
-            // Map encoder time to diarisation time (nearest-neighbour)
-            let diar_t = if diar_frames > 0 && encoder_time > 0 {
-                (enc_t * diar_frames / encoder_time).min(diar_frames - 1)
-            } else {
-                0
-            };
-
-            if diar_t < diar_frames && speaker_id < diar_preds.ncols() {
-                let spk_val = diar_preds[[diar_t, speaker_id]];
-                let bg_val = (0..diar_preds.ncols())
-                    .filter(|&j| j != speaker_id)
-                    .map(|j| diar_preds[[diar_t, j]])
-                    .fold(0.0f32, f32::max);
-                spk_vals.push(spk_val);
-                bg_vals.push(bg_val);
-            } else {
-                // No diarisation data: assume single speaker
-                spk_vals.push(1.0);
-                bg_vals.push(0.0);
-            }
-        }
-
-        let spk_targets = Array2::from_shape_vec((1, encoder_time), spk_vals)
-            .map_err(|e| Error::Model(format!("spk_targets shape mismatch: {e}")))?;
-        let bg_spk_targets = Array2::from_shape_vec((1, encoder_time), bg_vals)
-            .map_err(|e| Error::Model(format!("bg_spk_targets shape mismatch: {e}")))?;
-
-        Ok((spk_targets, bg_spk_targets))
     }
 
     fn build_mel_chunk(
@@ -1343,6 +1346,53 @@ mod tests {
         let auth = auth_rows(&[0.5]);
         let w = assemble_diar_window(&auth, NUM_SPEAKERS, 0, None, 3, 3);
         assert_eq!(w.nrows(), 0);
+    }
+
+    /// The geometry of a Normal-latency sub-chunk: 14 diarizer frames, and
+    /// 9 pre-encode + 112 mel entries, of which the graph reads the last 14.
+    const STEP_FRAMES: usize = 14;
+    const STEP_ENTRIES: usize = PRE_ENCODE_CACHE + 112;
+
+    fn step_preds(f: impl Fn(usize, usize) -> f32) -> Array2<f32> {
+        Array2::from_shape_fn((STEP_FRAMES, 3), |(t, s)| f(t, s))
+    }
+
+    #[test]
+    fn each_diarizer_frame_lands_on_the_entry_the_encoder_reads_for_it() {
+        let preds = step_preds(|t, s| s as f32 * 0.25 + t as f32 / 100.0);
+        let (spk, bg) = derive_speaker_targets(&preds, 1, STEP_ENTRIES).unwrap();
+        assert_eq!(spk.shape(), &[1, STEP_ENTRIES]);
+        let read = STEP_ENTRIES - STEP_FRAMES;
+        for t in 0..STEP_FRAMES {
+            assert_eq!(spk[[0, read + t]], preds[[t, 1]], "frame {t}");
+            assert_eq!(bg[[0, read + t]], preds[[t, 2]], "frame {t}: the loudest other slot");
+        }
+        assert!((0..read).all(|i| spk[[0, i]] == preds[[0, 1]]), "unread entries repeat frame 0");
+    }
+
+    /// The 2026-10-18 deletions: a speaker who stops talking before the
+    /// step ends is still talking for most of what the encoder reads.
+    #[test]
+    fn a_pause_at_the_end_of_a_step_does_not_silence_the_step() {
+        let preds = step_preds(|t, s| if s == 0 && t < 11 { 0.9 } else { 0.0 });
+        let (spk, _) = derive_speaker_targets(&preds, 0, STEP_ENTRIES).unwrap();
+        let read: Vec<f32> = spk.row(0).iter().skip(STEP_ENTRIES - STEP_FRAMES).copied().collect();
+        assert_eq!(read.iter().filter(|&&v| v > 0.5).count(), 11);
+    }
+
+    #[test]
+    fn more_frames_than_entries_keeps_the_newest() {
+        let preds = Array2::from_shape_fn((20, 2), |(t, _)| t as f32);
+        let (spk, _) = derive_speaker_targets(&preds, 0, 8).unwrap();
+        assert_eq!(spk.row(0).to_vec(), (12..20).map(|t| t as f32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn no_diarizer_frames_means_one_speaker_alone() {
+        let (spk, bg) = derive_speaker_targets(&Array2::zeros((0, 4)), 0, STEP_ENTRIES).unwrap();
+        assert!(spk.iter().all(|&v| v == 1.0) && bg.iter().all(|&v| v == 0.0));
+        let (spk, bg) = derive_speaker_targets(&step_preds(|_, _| 0.7), 5, STEP_ENTRIES).unwrap();
+        assert!(spk.iter().all(|&v| v == 1.0) && bg.iter().all(|&v| v == 0.0), "a slot past the matrix");
     }
 
     #[test]
