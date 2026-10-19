@@ -287,6 +287,15 @@ pub struct MultitalkerConfig {
     /// derives their targets; the emitted `speaker_activity` stays soft.
     /// Default false (soft conditioning, unchanged behaviour).
     pub binary_diar_preds: bool,
+
+    /// How many sub-chunks a speaker's activity keeps their decoder running:
+    /// a speaker is decoded in a sub-chunk when active in it or in any of the
+    /// `activity_gate_steps - 1` before it. NeMo's multitalker streaming
+    /// script gates this way with a buffer of 2 (`cache_gating_buffer_size`).
+    /// With 1, a speaker who stops is not decoded in the next sub-chunk, so
+    /// the tokens the decoder would still emit for their last words are lost.
+    /// Default 1 (this sub-chunk only, unchanged behaviour).
+    pub activity_gate_steps: usize,
 }
 
 impl Default for MultitalkerConfig {
@@ -299,6 +308,7 @@ impl Default for MultitalkerConfig {
             inter_chunk_pause: None,
             hold_at_settled_frontier: false,
             binary_diar_preds: false,
+            activity_gate_steps: 1,
         }
     }
 }
@@ -372,6 +382,14 @@ fn assemble_diar_window(
     }
 
     window
+}
+
+/// The speakers to decode: those whose activity anywhere in `gate` exceeds
+/// `threshold`, among the first `max_speakers` columns.
+fn active_speakers(gate: &Array2<f32>, max_speakers: usize, threshold: f32) -> Vec<usize> {
+    (0..max_speakers.min(gate.ncols()))
+        .filter(|&spk| gate.column(spk).iter().any(|&v| v > threshold))
+        .collect()
 }
 
 /// Speaker and background targets for one sub-chunk's encoder pass, from
@@ -556,6 +574,13 @@ impl MultitalkerASR {
     /// [`MultitalkerConfig::binary_diar_preds`]. Takes effect on the next call.
     pub fn set_binary_diar_preds(&mut self, on: bool) {
         self.config.binary_diar_preds = on;
+    }
+
+    /// Sub-chunks of activity that keep a speaker decoded — see
+    /// [`MultitalkerConfig::activity_gate_steps`]; at least 1. Takes effect
+    /// on the next sub-chunk.
+    pub fn set_activity_gate_steps(&mut self, steps: usize) {
+        self.config.activity_gate_steps = steps.max(1);
     }
 
     /// Upper bound, in seconds, on audio waiting behind the settled
@@ -873,19 +898,29 @@ impl MultitalkerASR {
                 &window
             };
 
-            // Determine active speakers in this sub-chunk
-            let mut active_speakers = Vec::new();
-            for spk_id in 0..self.config.max_speakers {
-                if spk_id >= routing.ncols() {
-                    break;
+            // Who gets a decoder pass: anyone active in this sub-chunk or,
+            // with `activity_gate_steps` > 1, in the ones just before it.
+            let lookback = (self.config.activity_gate_steps.max(1) - 1) * enc_frames;
+            let gate_window = (lookback > 0).then(|| {
+                let w = assemble_diar_window(
+                    &self.diar_preds,
+                    self.diarizer.num_speakers(),
+                    self.diar_pred_offset,
+                    provisional.as_ref(),
+                    f_start.saturating_sub(lookback),
+                    f_end,
+                );
+                if self.config.binary_diar_preds {
+                    w.mapv(|v| if v > 0.5 { 1.0 } else { 0.0 })
+                } else {
+                    w
                 }
-                let max_activity = (0..routing.nrows())
-                    .map(|t| routing[[t, spk_id]])
-                    .fold(0.0f32, f32::max);
-                if max_activity > self.config.activity_threshold {
-                    active_speakers.push(spk_id);
-                }
-            }
+            });
+            let active_speakers = active_speakers(
+                gate_window.as_ref().unwrap_or(routing),
+                self.config.max_speakers,
+                self.config.activity_threshold,
+            );
 
             // Ensure speaker instances exist
             for &spk_id in &active_speakers {
@@ -1355,6 +1390,28 @@ mod tests {
 
     fn step_preds(f: impl Fn(usize, usize) -> f32) -> Array2<f32> {
         Array2::from_shape_fn((STEP_FRAMES, 3), |(t, s)| f(t, s))
+    }
+
+    #[test]
+    fn a_speaker_active_only_in_the_previous_step_is_still_decoded_with_a_two_step_gate() {
+        // 28 frames = the previous step then this one; speaker 0 talks only
+        // in the previous step, speaker 1 only in this one.
+        let gate = Array2::from_shape_fn((28, 3), |(t, s)| match s {
+            0 if t < 14 => 1.0,
+            1 if t >= 14 => 1.0,
+            _ => 0.0,
+        });
+        assert_eq!(active_speakers(&gate, 3, 0.3), vec![0, 1]);
+        let this_step = gate.slice(s![14.., ..]).to_owned();
+        assert_eq!(active_speakers(&this_step, 3, 0.3), vec![1], "one step: speaker 0 is not decoded");
+    }
+
+    #[test]
+    fn active_speakers_respects_the_threshold_and_the_speaker_cap() {
+        let gate = Array2::from_shape_fn((14, 4), |(_, s)| [0.9, 0.2, 0.6, 0.95][s]);
+        assert_eq!(active_speakers(&gate, 4, 0.3), vec![0, 2, 3]);
+        assert_eq!(active_speakers(&gate, 2, 0.3), vec![0]);
+        assert_eq!(active_speakers(&gate, 8, 0.3), vec![0, 2, 3], "a cap past the matrix is the matrix");
     }
 
     #[test]
