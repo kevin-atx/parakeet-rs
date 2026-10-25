@@ -296,6 +296,15 @@ pub struct MultitalkerConfig {
     /// the tokens the decoder would still emit for their last words are lost.
     /// Default 1 (this sub-chunk only, unchanged behaviour).
     pub activity_gate_steps: usize,
+
+    /// With [`binary_diar_preds`](Self::binary_diar_preds): a run of frames
+    /// where the speaker slots TOGETHER exceed 0.5 but no single slot does
+    /// is binarised to the slot holding the most of the run's activity,
+    /// instead of to nobody. That is one talker the diarizer has spread over
+    /// several slots (0.2–0.45 each); plain binarisation gives the step no
+    /// active speaker, so no decoder runs and the words are lost. Silence
+    /// sums near 0 and is unaffected. Default false (unchanged behaviour).
+    pub binary_spread_fallback: bool,
 }
 
 impl Default for MultitalkerConfig {
@@ -309,6 +318,7 @@ impl Default for MultitalkerConfig {
             hold_at_settled_frontier: false,
             binary_diar_preds: false,
             activity_gate_steps: 1,
+            binary_spread_fallback: false,
         }
     }
 }
@@ -382,6 +392,40 @@ fn assemble_diar_window(
     }
 
     window
+}
+
+/// Binarise a diarization window for routing: p > 0.5 → 1, else 0. With
+/// `spread_fallback`, each run of frames whose slots together exceed 0.5
+/// while none alone does goes to the slot, among the first `max_speakers`,
+/// holding the most of the run's activity
+/// ([`MultitalkerConfig::binary_spread_fallback`]).
+fn binarise(window: &Array2<f32>, spread_fallback: bool, max_speakers: usize) -> Array2<f32> {
+    let mut out = window.mapv(|v| if v > 0.5 { 1.0 } else { 0.0 });
+    let slots = max_speakers.min(window.ncols());
+    if !spread_fallback || slots == 0 {
+        return out;
+    }
+    let spread = |t: usize| {
+        let row = window.row(t);
+        row.iter().all(|&v| v <= 0.5) && row.sum() > 0.5
+    };
+    let mut t = 0;
+    while t < window.nrows() {
+        if !spread(t) {
+            t += 1;
+            continue;
+        }
+        let start = t;
+        while t < window.nrows() && spread(t) {
+            t += 1;
+        }
+        let run = window.slice(s![start..t, ..]);
+        let slot = (0..slots)
+            .max_by(|&a, &b| run.column(a).sum().total_cmp(&run.column(b).sum()))
+            .unwrap_or(0);
+        out.slice_mut(s![start..t, slot]).fill(1.0);
+    }
+    out
 }
 
 /// The speakers to decode: those whose activity anywhere in `gate` exceeds
@@ -574,6 +618,13 @@ impl MultitalkerASR {
     /// [`MultitalkerConfig::binary_diar_preds`]. Takes effect on the next call.
     pub fn set_binary_diar_preds(&mut self, on: bool) {
         self.config.binary_diar_preds = on;
+    }
+
+    /// Binarised conditioning's fallback for a talker spread over several
+    /// slots — see [`MultitalkerConfig::binary_spread_fallback`]. Takes
+    /// effect on the next call.
+    pub fn set_binary_spread_fallback(&mut self, on: bool) {
+        self.config.binary_spread_fallback = on;
     }
 
     /// Sub-chunks of activity that keep a speaker decoded — see
@@ -892,7 +943,7 @@ impl MultitalkerASR {
             // copy (`binary_diar_preds`). The soft window is what's emitted.
             let binarised;
             let routing = if self.config.binary_diar_preds {
-                binarised = window.mapv(|v| if v > 0.5 { 1.0 } else { 0.0 });
+                binarised = binarise(&window, self.config.binary_spread_fallback, self.config.max_speakers);
                 &binarised
             } else {
                 &window
@@ -911,7 +962,7 @@ impl MultitalkerASR {
                     f_end,
                 );
                 if self.config.binary_diar_preds {
-                    w.mapv(|v| if v > 0.5 { 1.0 } else { 0.0 })
+                    binarise(&w, self.config.binary_spread_fallback, self.config.max_speakers)
                 } else {
                     w
                 }
@@ -1404,6 +1455,32 @@ mod tests {
         assert_eq!(active_speakers(&gate, 3, 0.3), vec![0, 1]);
         let this_step = gate.slice(s![14.., ..]).to_owned();
         assert_eq!(active_speakers(&this_step, 3, 0.3), vec![1], "one step: speaker 0 is not decoded");
+    }
+
+    /// 2026-10-24: one talker spread over three slots at 0.2–0.45 each for
+    /// two minutes binarised to nobody, and ~1,850 words were not decoded.
+    #[test]
+    fn a_talker_spread_over_slots_goes_to_the_slot_holding_most_of_it() {
+        // Frames 0-3 silence; 4-9 spread over slots 1-3 (slot 2 strongest
+        // overall, slot 3 strongest on some frames); 10-13 slot 0 clear.
+        let w = Array2::from_shape_fn((14, 4), |(t, s)| match (t, s) {
+            (4..=9, 1) => 0.25,
+            (4..=9, 2) => if t % 2 == 0 { 0.45 } else { 0.30 },
+            (4..=9, 3) => if t % 2 == 0 { 0.20 } else { 0.40 },
+            (10.., 0) => 0.9,
+            (0..=3, _) => 0.02,
+            _ => 0.0,
+        });
+        let plain = binarise(&w, false, 4);
+        assert_eq!(active_speakers(&plain, 4, 0.3), vec![0], "plain: the spread talker is decoded by no one");
+        let b = binarise(&w, true, 4);
+        assert_eq!(active_speakers(&b, 4, 0.3), vec![0, 2]);
+        assert!((4..=9).all(|t| b[[t, 2]] == 1.0 && b[[t, 1]] == 0.0 && b[[t, 3]] == 0.0), "one slot for the run");
+        assert!((0..=3).all(|t| b.row(t).sum() == 0.0), "silence stays silent");
+        assert_eq!(b.slice(s![10.., ..]), plain.slice(s![10.., ..]), "a clear frame is unchanged");
+        // The speaker cap: the strongest slot past it is not chosen.
+        let capped = binarise(&w, true, 2);
+        assert!((4..=9).all(|t| capped[[t, 1]] == 1.0));
     }
 
     #[test]
